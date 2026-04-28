@@ -340,17 +340,16 @@ class RolloutCollector:
                 self.policy.tokenizer.encode(prompt_text)
             )
 
-            # Generate action
-            model_output, log_probs = self.policy.generate_with_log_probs(
-                prompt_text, max_tokens=self.max_tokens
+            # Generate action — capture the exact sampled token ids so we
+            # don't desynchronize log_probs from action_tokens via a BPE
+            # decode/encode round-trip.
+            model_output, log_probs, action_tokens = (
+                self.policy.generate_with_log_probs(
+                    prompt_text, max_tokens=self.max_tokens
+                )
             )
 
             action = self.env.extract_action(model_output)
-
-            # Tokenize the generated text for action_tokens
-            action_tokens: list[int] = list(
-                self.policy.tokenizer.encode(model_output)
-            )
 
             if action is None:
                 # Invalid action: apply penalty, do not step environment

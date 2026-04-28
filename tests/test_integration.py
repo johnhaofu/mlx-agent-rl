@@ -27,6 +27,7 @@ def _make_mock_policy(action_output: str = "<action>answer(4)</action>"):
     policy.generate_with_log_probs.return_value = (
         action_output,
         [-0.5, -0.4, -0.6],
+        [101, 102, 103],
     )
     return policy
 

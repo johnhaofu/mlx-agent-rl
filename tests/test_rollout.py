@@ -17,8 +17,12 @@ def _make_mock_policy(action_output: str = "<action>answer(4)</action>"):
     policy = MagicMock()
     # tokenizer.encode returns a list of ints
     policy.tokenizer.encode.side_effect = lambda text: list(range(len(text.split())))
-    # generate_with_log_probs returns (text, log_probs)
-    policy.generate_with_log_probs.return_value = (action_output, [-0.5, -0.4, -0.6])
+    # generate_with_log_probs returns (text, log_probs, generated_tokens)
+    policy.generate_with_log_probs.return_value = (
+        action_output,
+        [-0.5, -0.4, -0.6],
+        [101, 102, 103],
+    )
     return policy
 
 

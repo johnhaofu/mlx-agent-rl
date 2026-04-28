@@ -42,10 +42,17 @@ def test_generate_with_log_probs_returns_tuple():
 
     policy = Policy(MODEL_PATH, lora_rank=4, lora_layers=2)
     policy.eval()
-    text, log_probs = policy.generate_with_log_probs("What is 2 + 2?", max_tokens=16)
+    text, log_probs, tokens = policy.generate_with_log_probs(
+        "What is 2 + 2?", max_tokens=16
+    )
     assert isinstance(text, str)
     assert isinstance(log_probs, list)
     assert len(log_probs) > 0
+    # tokens must align 1-1 with log_probs (the whole point of returning them)
+    assert isinstance(tokens, list)
+    assert len(tokens) == len(log_probs)
+    for tok in tokens:
+        assert isinstance(tok, int)
     # All log-probs should be negative (log of a probability <= 1)
     for lp in log_probs:
         assert isinstance(lp, float)
@@ -58,10 +65,11 @@ def test_generate_with_log_probs_length_matches():
 
     policy = Policy(MODEL_PATH, lora_rank=4, lora_layers=2)
     policy.eval()
-    text, log_probs = policy.generate_with_log_probs("Hello", max_tokens=8)
-    # Each token in the decoded text should have one log-prob
-    # (we can't easily check exact token count, but length must be > 0)
+    text, log_probs, tokens = policy.generate_with_log_probs("Hello", max_tokens=8)
+    # Each generated token should have one log-prob; tokens and log_probs
+    # must remain in lockstep (no encode/decode round-trip).
     assert len(log_probs) > 0
+    assert len(tokens) == len(log_probs)
 
 
 @skip_if_no_model

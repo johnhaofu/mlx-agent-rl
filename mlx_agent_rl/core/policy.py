@@ -89,7 +89,7 @@ class Policy:
 
     def generate_with_log_probs(
         self, prompt: str, max_tokens: int = 256
-    ) -> tuple[str, list[float]]:
+    ) -> tuple[str, list[float], list[int]]:
         """Generate text and collect per-token log probabilities.
 
         Returns
@@ -98,6 +98,12 @@ class Policy:
             The generated string (decoded).
         log_probs:
             List of per-token log-probabilities (one per generated token).
+        generated_tokens:
+            The exact token ids that were sampled — must be used as
+            ``action_tokens`` for log-prob recomputation in PPO update.
+            Re-encoding the decoded text is unsafe because BPE round-trips
+            do not preserve token boundaries, which silently misaligns
+            ``log_probs`` and the recomputed ones inside the trainer.
         """
         prompt_tokens = self._wrapped_tokenizer.encode(prompt)
         if isinstance(prompt_tokens, list):
@@ -127,7 +133,7 @@ class Policy:
                 break
 
         text = self.tokenizer.decode(generated_tokens)
-        return text, log_probs
+        return text, log_probs, generated_tokens
 
     def compute_log_probs(
         self, prompt_tokens: list[int], action_tokens: list[int]
