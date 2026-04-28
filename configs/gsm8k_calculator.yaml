@@ -9,10 +9,10 @@ rollout:
   max_steps: 5
   max_tokens: 256
   system_prompt: |
-    You are a math assistant with a calculator tool. To solve problems, use these actions:
-    - <action>calculate(expression)</action> to evaluate a math expression
-    - <action>answer(number)</action> to submit your final answer
-    Always wrap your action in <action>...</action> tags. Think step by step.
+    Solve the math word problem step by step. After each calculation, verify the
+    result. To finish, you MUST call the `answer` tool with your final number.
+    Do NOT write the answer in plain text or in a \boxed{} — the task is only
+    considered complete when the `answer` tool is called.
 training:
   algorithm: dapo
   lr: 0.000001

@@ -1,3 +1,4 @@
+import json
 import re
 
 from mlx_agent_rl.environments.base import BaseEnvironment, Observation
@@ -6,6 +7,47 @@ _SAFE_EXPR_RE = re.compile(r"^[\d\s\+\-\*\/\.\(\)\%\*\*]+$")
 _CALCULATE_RE = re.compile(r"calculate\((.+?)\)")
 _ANSWER_RE = re.compile(r"answer\(([^\)]+)\)")
 _ACTION_RE = re.compile(r"<action>(.*?)</action>", re.DOTALL)
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+
+
+_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "Evaluate an arithmetic expression and return the numeric result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "A math expression using digits and + - * / ( ) %, e.g. '60 / 2' or '12*7'.",
+                    }
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "answer",
+            "description": (
+                "Submit the final numeric answer. You MUST call this tool to "
+                "finish the task — the conversation does not end until you do. "
+                "Plain-text answers, \\boxed{...}, or 'The answer is N' are NOT "
+                "accepted. Always wrap your final number in a call to this tool."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": "number", "description": "The final numeric answer."}
+                },
+                "required": ["value"],
+            },
+        },
+    },
+]
 
 
 class CalculatorEnvironment(BaseEnvironment):
@@ -21,7 +63,31 @@ class CalculatorEnvironment(BaseEnvironment):
             self._expected = None
         return Observation(text=prompt, done=False, anchor=prompt)
 
+    def get_tools_schema(self) -> list[dict]:
+        """Return the JSON-schema tool definitions for chat-template tools= argument."""
+        return _TOOLS_SCHEMA
+
     def extract_action(self, model_output: str) -> str | None:
+        # Prefer Qwen3-native <tool_call>{json}</tool_call> format
+        tc = _TOOL_CALL_RE.search(model_output)
+        if tc:
+            try:
+                call = json.loads(tc.group(1))
+                name = call.get("name", "")
+                args = call.get("arguments", {}) or {}
+                if isinstance(args, str):
+                    args = json.loads(args)
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                return None
+            if name == "calculate":
+                expr = args.get("expression", "")
+                return f"calculate({expr})"
+            if name == "answer":
+                val = args.get("value", "")
+                return f"answer({val})"
+            return None
+
+        # Fallback: legacy <action>...</action> format
         match = _ACTION_RE.search(model_output)
         if not match:
             return None

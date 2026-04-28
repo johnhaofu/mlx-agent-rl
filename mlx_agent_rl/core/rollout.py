@@ -59,6 +59,11 @@ class RolloutCollector:
         self.invalid_action_penalty = invalid_action_penalty
         self.system_prompt = system_prompt
         self.backend = backend
+        # Native chat-template tool descriptors (Qwen3 etc.). When the env
+        # exposes get_tools_schema we pass it through to apply_chat_template,
+        # which prepends a <tools> system block and biases the model toward
+        # <tool_call> output.
+        self._tools = env.get_tools_schema() if hasattr(env, "get_tools_schema") else None
 
     # ------------------------------------------------------------------
     # Main API
@@ -188,7 +193,10 @@ class RolloutCollector:
                 if action is None:
                     reward = self.invalid_action_penalty
                     done = False
-                    new_obs_text = slot["obs"].text
+                    new_obs_text = (
+                        "Error: no <tool_call> detected. Respond with a "
+                        "<tool_call>{\"name\": ..., \"arguments\": {...}}</tool_call>."
+                    )
                 else:
                     next_obs, reward, done = self.env.step(action)
                     new_obs_text = next_obs.text
@@ -212,8 +220,9 @@ class RolloutCollector:
                 if done:
                     slot["done"] = True
                 else:
-                    taken_action = action if action is not None else model_output
-                    slot["memory"].update(new_obs_text, taken_action)
+                    # Store the full model output so chat replay sees the
+                    # actual <tool_call> tokens the model emitted.
+                    slot["memory"].update(new_obs_text, model_output)
 
         # ----------------------------------------------------------------
         # Second pass: compute log_probs for every step via MLX policy
@@ -253,16 +262,18 @@ class RolloutCollector:
         memory: SlidingMemory,
         question: str | None = None,
     ) -> str:
-        """Build prompt using chat template when the tokenizer supports one.
+        """Build prompt via chat template (with tools) when available.
 
-        Multi-turn structure (preserves the original question across turns):
-            system: <system_prompt>
-            user:   Observation: <question>
-            assistant: <action_1>
-            user:   Observation: <env_response_1>
-            assistant: <action_2>
+        Multi-turn structure (Qwen3 / OpenAI tool-calling style):
+            system: <system_prompt> + auto-generated <tools> block
+            user:   <question>
+            assistant: <prev model output, contains <tool_call>...</tool_call>>
+            tool:   <env response 1>
+            assistant: <prev model output 2>
+            tool:   <env response 2>
             ...
-            user:   Observation: <obs_text>            # current turn input
+        Memory entries store ``(env_response_text, full_model_output_text)``
+        so each replay matches what the model actually emitted.
         Falls back to plain-text concatenation if no chat template is available.
         """
         tokenizer = self.policy.tokenizer
@@ -270,30 +281,21 @@ class RolloutCollector:
             messages: list[dict] = []
             if self.system_prompt:
                 messages.append({"role": "system", "content": self.system_prompt})
-            messages.append({"role": "user", "content": f"Observation: {question}"})
+            messages.append({"role": "user", "content": question})
             history = memory._history[-memory.window_size:] if memory._history else []
-            for resp_obs, action in history:
-                messages.append({"role": "assistant", "content": action})
-                messages.append({"role": "user", "content": f"Observation: {resp_obs}"})
-            # If the current obs hasn't been written into memory yet (it's the
-            # input for *this* turn), the last user message in `messages` is
-            # already the prior env response — but only if memory is non-empty
-            # and obs_text == that response. When memory is empty, current obs
-            # IS the question and was added above. Otherwise current obs equals
-            # the latest memory entry, already present, so no extra append needed.
+            for resp_obs, model_output in history:
+                messages.append({"role": "assistant", "content": model_output})
+                messages.append({"role": "tool", "content": resp_obs})
+            kwargs = {"tokenize": False, "add_generation_prompt": True}
+            if self._tools is not None:
+                kwargs["tools"] = self._tools
+            # enable_thinking is Qwen3-specific; some tokenizers reject it.
             try:
                 return tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=False,
+                    messages, enable_thinking=False, **kwargs
                 )
             except TypeError:
-                return tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                return tokenizer.apply_chat_template(messages, **kwargs)
 
         # Fallback: plain text
         parts: list[str] = []
@@ -339,7 +341,10 @@ class RolloutCollector:
                 # Invalid action: apply penalty, do not step environment
                 reward = self.invalid_action_penalty
                 done = False
-                obs_text_new = obs.text
+                obs_text_new = (
+                    "Error: no <tool_call> detected. Respond with a "
+                    "<tool_call>{\"name\": ..., \"arguments\": {...}}</tool_call>."
+                )
             else:
                 next_obs, reward, done = self.env.step(action)
                 obs_text_new = next_obs.text
@@ -360,8 +365,7 @@ class RolloutCollector:
             if done:
                 break
 
-            # Update memory with the action that was taken
-            taken_action = action if action is not None else model_output
-            self.memory.update(obs_text_new, taken_action)
+            # Store full model output so chat replay sees the <tool_call> tokens.
+            self.memory.update(obs_text_new, model_output)
 
         return Trajectory(steps=steps, episode_reward=total_reward, uid=uid)
