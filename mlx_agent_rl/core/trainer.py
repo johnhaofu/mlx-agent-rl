@@ -52,6 +52,7 @@ class TrainingConfig:
     epsilon: float = 0.2
     epsilon_high: float = 0.28
     clip_grad: float = 1.0
+    micro_batch_size: int = 4  # samples per backward pass; controls peak memory
 
 
 @dataclass
@@ -76,7 +77,8 @@ class LlamaCppConfig:
     enabled: bool = False
     gguf_path: str = ""
     port: int = 8090
-    n_parallel: int = 16
+    n_parallel: int = 8
+    n_ctx: int = 16384
 
 
 @dataclass
@@ -135,6 +137,7 @@ class TrainerConfig:
                 epsilon=t.get("epsilon", 0.2),
                 epsilon_high=t.get("epsilon_high", 0.28),
                 clip_grad=t.get("clip_grad", 1.0),
+                micro_batch_size=t.get("micro_batch_size", 4),
             )
 
         if "environment" in raw:
@@ -166,7 +169,8 @@ class TrainerConfig:
                 enabled=lc.get("enabled", False),
                 gguf_path=lc.get("gguf_path", ""),
                 port=lc.get("port", 8090),
-                n_parallel=lc.get("n_parallel", 16),
+                n_parallel=lc.get("n_parallel", 8),
+                n_ctx=lc.get("n_ctx", 16384),
             )
 
         return cfg
@@ -219,6 +223,7 @@ class Trainer:
                 gguf_path=config.llamacpp.gguf_path,
                 port=config.llamacpp.port,
                 n_parallel=config.llamacpp.n_parallel,
+                n_ctx=config.llamacpp.n_ctx,
             )
         elif config.mlc.enabled:
             from mlx_agent_rl.core.mlc_backend import MLCBackend
@@ -362,9 +367,15 @@ class Trainer:
         if not samples:
             return 0.0
 
-        def loss_fn(model):
-            total_loss = mx.array(0.0)
-            for prompt_toks, action_toks, old_lps_list, adv in samples:
+        from mlx.utils import tree_map
+
+        n_samples = len(samples)
+        micro_bs = max(1, self.config.training.micro_batch_size)
+
+        def chunk_loss_sum(model, chunk):
+            """Sum (not mean) of per-sample PPO-clip losses for a chunk."""
+            loss = mx.array(0.0)
+            for prompt_toks, action_toks, old_lps_list, adv in chunk:
                 new_lps = _compute_log_probs_mx(model, prompt_toks, action_toks)
                 old_lps = mx.array(old_lps_list)
                 min_len = min(new_lps.shape[0], old_lps.shape[0])
@@ -375,16 +386,43 @@ class Trainer:
                 ratio = mx.exp(new_lps - old_lps)
                 adv_arr = mx.array(adv)
                 clipped = mx.clip(ratio, 1.0 - eps_low, 1.0 + eps_high)
-                total_loss = total_loss + (-mx.minimum(ratio * adv_arr, clipped * adv_arr)).mean()
-            return total_loss / len(samples)
+                loss = loss + (-mx.minimum(ratio * adv_arr, clipped * adv_arr)).mean()
+            return loss
 
         self.policy.train()
-        loss_val, grads = nn.value_and_grad(self.policy.model, loss_fn)(self.policy.model)
-        self.optimizer.update(self.policy.model, grads)
+
+        # Accumulate gradients across micro-batches. Each micro-batch is its own
+        # autograd graph that gets evaluated and freed before the next one starts,
+        # bounding peak activation memory to ~micro_bs sequences worth of layers.
+        accumulated_grads = None
+        total_loss_sum = 0.0
+        for start in range(0, n_samples, micro_bs):
+            chunk = samples[start : start + micro_bs]
+
+            def fn(model, chunk=chunk):
+                return chunk_loss_sum(model, chunk)
+
+            chunk_loss, chunk_grads = nn.value_and_grad(self.policy.model, fn)(
+                self.policy.model
+            )
+            mx.eval(chunk_loss, chunk_grads)
+            total_loss_sum += float(chunk_loss)
+
+            if accumulated_grads is None:
+                accumulated_grads = chunk_grads
+            else:
+                accumulated_grads = tree_map(
+                    lambda a, g: a + g, accumulated_grads, chunk_grads
+                )
+            mx.eval(accumulated_grads)
+
+        # Match the original mean-over-samples reduction.
+        final_grads = tree_map(lambda g: g / n_samples, accumulated_grads)
+        self.optimizer.update(self.policy.model, final_grads)
         mx.eval(self.policy.model.parameters(), self.optimizer.state)
         self.policy.eval()
 
-        return float(loss_val)
+        return total_loss_sum / n_samples
 
 
 # ---------------------------------------------------------------------------

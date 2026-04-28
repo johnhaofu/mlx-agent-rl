@@ -49,16 +49,16 @@ class Policy:
         if quantize is not None:
             nn.quantize(self.model, bits=quantize)
 
-        # Apply LoRA to the last `lora_layers` transformer blocks
-        lora_config = {
-            "rank": lora_rank,
-            "scale": 1.0,
-            "dropout": 0.0,
-        }
-        linear_to_lora_layers(self.model, lora_layers, lora_config)
-        self.model.freeze()
-        # Unfreeze only the LoRA parameters
-        self.model.trainable_parameters()  # initialize trainable param list
+        # LoRA mode: freeze base, apply LoRA adapters to trailing layers.
+        # Full-param mode: leave all parameters trainable (lora_layers=0).
+        if lora_layers > 0:
+            self.model.freeze()
+            lora_config = {
+                "rank": lora_rank,
+                "scale": 1.0,
+                "dropout": 0.0,
+            }
+            linear_to_lora_layers(self.model, lora_layers, lora_config)
 
         # Wrap tokenizer if needed
         if not isinstance(self.tokenizer, TokenizerWrapper):
