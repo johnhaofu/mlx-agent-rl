@@ -66,12 +66,19 @@ class MemoryConfig:
 
 
 @dataclass
+class MLCConfig:
+    enabled: bool = False
+    model_id: str = "HF://mlc-ai/Qwen2.5-0.5B-Instruct-q4f16_1-MLC"
+
+
+@dataclass
 class TrainerConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    mlc: MLCConfig = field(default_factory=MLCConfig)
 
     # ------------------------------------------------------------------
     # Factory
@@ -134,6 +141,16 @@ class TrainerConfig:
                 window_size=mem.get("window_size", 3),
             )
 
+        if "mlc" in raw:
+            mlc = raw["mlc"]
+            cfg.mlc = MLCConfig(
+                enabled=mlc.get("enabled", False),
+                model_id=mlc.get(
+                    "model_id",
+                    "HF://mlc-ai/Qwen2.5-0.5B-Instruct-q4f16_1-MLC",
+                ),
+            )
+
         return cfg
 
 
@@ -174,6 +191,13 @@ class Trainer:
             epsilon=config.training.epsilon,
             epsilon_high=config.training.epsilon_high,
         )
+        # Optionally create the MLC backend for fast batched generation
+        mlc_backend = None
+        if config.mlc.enabled:
+            from mlx_agent_rl.core.mlc_backend import MLCBackend
+
+            mlc_backend = MLCBackend(config.mlc.model_id)
+
         self.collector = RolloutCollector(
             policy=self.policy,
             env=self.env,
@@ -182,10 +206,10 @@ class Trainer:
             max_tokens=config.rollout.max_tokens,
             invalid_action_penalty=config.environment.invalid_action_penalty,
             system_prompt=config.rollout.system_prompt,
+            mlc_backend=mlc_backend,
         )
 
         # Optimizer — only update LoRA parameters
-        trainable = [p for _, p in self.policy.model.trainable_parameters()]
         self.optimizer = optim.Adam(learning_rate=config.training.lr)
 
     # ------------------------------------------------------------------
@@ -243,13 +267,17 @@ class Trainer:
             total_loss = 0.0
             num_updates = 0
 
-            for batch_start in range(0, len(shuffled), batch_size):
+            num_batches = (len(shuffled) + batch_size - 1) // batch_size
+            for batch_idx, batch_start in enumerate(range(0, len(shuffled), batch_size)):
                 batch = shuffled[batch_start : batch_start + batch_size]
 
                 # Collect rollouts
                 trajectories = self.collector.collect(
                     batch, group_size=cfg.rollout.group_size
                 )
+
+                avg_reward = sum(t.episode_reward for t in trajectories) / len(trajectories)
+                success_rate = sum(1 for t in trajectories if t.succeeded) / len(trajectories)
 
                 # Compute advantages
                 advantages = self.algorithm.compute(trajectories)
@@ -259,8 +287,14 @@ class Trainer:
                 total_loss += loss
                 num_updates += 1
 
+                print(
+                    f"  [{batch_idx+1}/{num_batches}] "
+                    f"reward={avg_reward:.2f} success={success_rate:.0%} loss={loss:.4f}",
+                    flush=True,
+                )
+
             avg_loss = total_loss / max(num_updates, 1)
-            print(f"Epoch {epoch + 1}/{cfg.training.epochs}  loss={avg_loss:.4f}")
+            print(f"Epoch {epoch + 1}/{cfg.training.epochs}  avg_loss={avg_loss:.4f}", flush=True)
 
     # ------------------------------------------------------------------
     # Policy update (PPO-clip)
@@ -285,54 +319,43 @@ class Trainer:
             else self.config.training.epsilon
         )
 
+        # Collect all (prompt_tokens, action_tokens, old_log_probs, advantage) pairs
+        samples = []
+        for traj_idx, traj in enumerate(trajectories):
+            for step_idx, step in enumerate(traj.steps):
+                if len(step.action_tokens) == 0:
+                    continue
+                samples.append((
+                    step.prompt_tokens,
+                    step.action_tokens,
+                    step.log_probs,
+                    advantages[traj_idx][step_idx],
+                ))
+
+        if not samples:
+            return 0.0
+
         def loss_fn(model):
             total_loss = mx.array(0.0)
-            count = 0
+            for prompt_toks, action_toks, old_lps_list, adv in samples:
+                new_lps = _compute_log_probs_mx(model, prompt_toks, action_toks)
+                old_lps = mx.array(old_lps_list)
+                min_len = min(new_lps.shape[0], old_lps.shape[0])
+                if min_len == 0:
+                    continue
+                new_lps = new_lps[:min_len]
+                old_lps = mx.stop_gradient(old_lps[:min_len])
+                ratio = mx.exp(new_lps - old_lps)
+                adv_arr = mx.array(adv)
+                clipped = mx.clip(ratio, 1.0 - eps_low, 1.0 + eps_high)
+                total_loss = total_loss + (-mx.minimum(ratio * adv_arr, clipped * adv_arr)).mean()
+            return total_loss / len(samples)
 
-            for traj_idx, traj in enumerate(trajectories):
-                for step_idx, step in enumerate(traj.steps):
-                    adv = advantages[traj_idx][step_idx]
-                    if len(step.action_tokens) == 0:
-                        continue
-
-                    # New log-probs (differentiable)
-                    new_lps = _compute_log_probs_mx(
-                        model,
-                        step.prompt_tokens,
-                        step.action_tokens,
-                    )
-
-                    # Old log-probs (constant — from rollout)
-                    old_lps = mx.array(step.log_probs)
-                    # Align lengths: use min length in case of tokenizer mismatch
-                    min_len = min(new_lps.shape[0], old_lps.shape[0])
-                    if min_len == 0:
-                        continue
-
-                    new_lps = new_lps[:min_len]
-                    old_lps = old_lps[:min_len]
-
-                    log_ratio = new_lps - old_lps
-                    ratio = mx.exp(log_ratio)
-
-                    adv_arr = mx.array(adv)
-                    clipped = mx.clip(ratio, 1.0 - eps_low, 1.0 + eps_high)
-                    ppo_loss = -mx.minimum(ratio * adv_arr, clipped * adv_arr)
-                    total_loss = total_loss + ppo_loss.mean()
-                    count += 1
-
-            if count == 0:
-                return total_loss
-            return total_loss / count
-
-        loss_and_grad = nn.value_and_grad(self.policy.model, loss_fn)
-        loss_val, grads = loss_and_grad(self.policy.model)
-
-        # Clip gradients
-        grads, _ = optim.clip_grad_norm(grads, max_norm=self.config.training.clip_grad)
-
+        self.policy.train()
+        loss_val, grads = nn.value_and_grad(self.policy.model, loss_fn)(self.policy.model)
         self.optimizer.update(self.policy.model, grads)
         mx.eval(self.policy.model.parameters(), self.optimizer.state)
+        self.policy.eval()
 
         return float(loss_val)
 

@@ -8,11 +8,16 @@ rollout:
   group_size: 4
   max_steps: 5
   max_tokens: 256
+  system_prompt: |
+    You are a math assistant with a calculator tool. To solve problems, use these actions:
+    - <action>calculate(expression)</action> to evaluate a math expression
+    - <action>answer(number)</action> to submit your final answer
+    Always wrap your action in <action>...</action> tags. Think step by step.
 training:
   algorithm: dapo
   lr: 0.000001
   epochs: 10
-  batch_size: 2
+  batch_size: 4
   epsilon: 0.0001
   epsilon_high: 0.01
 environment:
@@ -20,3 +25,6 @@ environment:
   invalid_action_penalty: -0.1
 memory:
   window_size: 3
+mlc:
+  enabled: false
+  model_id: "HF://mlc-ai/Qwen2.5-0.5B-Instruct-q4f16_1-MLC"
