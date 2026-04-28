@@ -25,13 +25,14 @@ training:
   val_temperature: 0.4
   val_top_p: 1.0
   ppo_epochs: 4              # PPO standard: reuse each rollout for 4 update passes
-  kl_coef: 0.02              # KL(current || frozen base) initial weight (adaptive)
+  kl_coef: 0.01              # match verl-agent NumberLine kl_loss_coef
   clip_ratio_c: 3.0          # dual-clip lower bound for negative-advantage steps
   entropy_coef: 0.001        # small entropy bonus to keep policy from collapsing
   kl_ctrl_type: adaptive     # auto-tune kl_coef toward kl_target
-  kl_target: 0.01            # observed KL target per update (verl default)
+  kl_target: 0.01            # observed KL target per update
   kl_horizon: 200            # how fast the controller adapts
   gigpo_mode: mean_norm      # verl-agent default: subtract mean only, don't divide std
+  val_before_train: true     # run a baseline val at step 0 for a clean reference point
 environment:
   type: numberline
   invalid_action_penalty: -0.1

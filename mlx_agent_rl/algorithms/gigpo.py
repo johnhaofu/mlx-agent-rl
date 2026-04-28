@@ -27,7 +27,7 @@ class GiGPOEstimator(GRPOEstimator):
         self,
         epsilon: float = 1e-4,
         step_advantage_w: float = 1.0,
-        gamma: float = 0.99,
+        gamma: float = 0.95,
         mode: str = "mean_std_norm",
     ) -> None:
         super().__init__(epsilon=epsilon, mode=mode)

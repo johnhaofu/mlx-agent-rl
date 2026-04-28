@@ -85,6 +85,7 @@ class TrainingConfig:
     val_interval: int = 5  # run val eval every N train batches (0 disables)
     val_temperature: float = 0.4  # low-variance sampling for val (not greedy)
     val_top_p: float = 1.0
+    val_before_train: bool = True  # run a baseline val pass at step 0
     ppo_epochs: int = 4  # number of update passes over each rollout batch
     kl_coef: float = 0.05  # initial KL(current || reference) penalty weight (0 disables)
     clip_ratio_c: float = 3.0  # dual-clip lower bound for negative-advantage steps
@@ -190,6 +191,7 @@ class TrainerConfig:
                 val_interval=t.get("val_interval", 5),
                 val_temperature=t.get("val_temperature", 0.4),
                 val_top_p=t.get("val_top_p", 1.0),
+                val_before_train=t.get("val_before_train", True),
                 ppo_epochs=t.get("ppo_epochs", 4),
                 kl_coef=t.get("kl_coef", 0.05),
                 clip_ratio_c=t.get("clip_ratio_c", 3.0),
@@ -426,6 +428,13 @@ class Trainer:
         self.policy.train()
         rolling_window = 10
         rolling = deque(maxlen=rolling_window)  # tuples (reward, answered, correct)
+
+        if (
+            cfg.training.val_before_train
+            and self.val_dataset is not None
+            and cfg.training.val_interval > 0
+        ):
+            self._evaluate(global_step=0)
 
         for epoch in range(cfg.training.epochs):
             shuffled = list(self.dataset)
@@ -666,8 +675,11 @@ class Trainer:
 
                 sample_loss = pg_loss
                 if kl_coef > 0:
+                    # k3 / low_var_kl per Schulman; matches verl-agent's
+                    # ``kl_penalty`` for both names. Clamp to [-10, 10] for
+                    # numerical safety against log_prob outliers.
                     delta = ref_l - new_lps  # log(p_ref / p_new)
-                    kl = mx.exp(delta) - delta - 1.0
+                    kl = mx.clip(mx.exp(delta) - delta - 1.0, -10.0, 10.0)
                     sample_loss = sample_loss + kl_coef * kl
                 if entropy_coef > 0:
                     # Approximate per-token entropy with -new_lps (single-sample
