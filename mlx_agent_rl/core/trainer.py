@@ -72,6 +72,14 @@ class MLCConfig:
 
 
 @dataclass
+class LlamaCppConfig:
+    enabled: bool = False
+    gguf_path: str = ""
+    port: int = 8090
+    n_parallel: int = 16
+
+
+@dataclass
 class TrainerConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
@@ -79,6 +87,7 @@ class TrainerConfig:
     environment: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     mlc: MLCConfig = field(default_factory=MLCConfig)
+    llamacpp: LlamaCppConfig = field(default_factory=LlamaCppConfig)
 
     # ------------------------------------------------------------------
     # Factory
@@ -151,6 +160,15 @@ class TrainerConfig:
                 ),
             )
 
+        if "llamacpp" in raw:
+            lc = raw["llamacpp"]
+            cfg.llamacpp = LlamaCppConfig(
+                enabled=lc.get("enabled", False),
+                gguf_path=lc.get("gguf_path", ""),
+                port=lc.get("port", 8090),
+                n_parallel=lc.get("n_parallel", 16),
+            )
+
         return cfg
 
 
@@ -191,12 +209,21 @@ class Trainer:
             epsilon=config.training.epsilon,
             epsilon_high=config.training.epsilon_high,
         )
-        # Optionally create the MLC backend for fast batched generation
-        mlc_backend = None
-        if config.mlc.enabled:
+        # Optionally create a batched generation backend.
+        # llama.cpp takes priority over MLC when both are enabled.
+        rollout_backend = None
+        if config.llamacpp.enabled:
+            from mlx_agent_rl.core.llamacpp_backend import LlamaCppBackend
+
+            rollout_backend = LlamaCppBackend(
+                gguf_path=config.llamacpp.gguf_path,
+                port=config.llamacpp.port,
+                n_parallel=config.llamacpp.n_parallel,
+            )
+        elif config.mlc.enabled:
             from mlx_agent_rl.core.mlc_backend import MLCBackend
 
-            mlc_backend = MLCBackend(config.mlc.model_id)
+            rollout_backend = MLCBackend(config.mlc.model_id)
 
         self.collector = RolloutCollector(
             policy=self.policy,
@@ -206,7 +233,7 @@ class Trainer:
             max_tokens=config.rollout.max_tokens,
             invalid_action_penalty=config.environment.invalid_action_penalty,
             system_prompt=config.rollout.system_prompt,
-            mlc_backend=mlc_backend,
+            backend=rollout_backend,
         )
 
         # Optimizer — only update LoRA parameters

@@ -29,10 +29,12 @@ class RolloutCollector:
         Reward applied when the model outputs an unrecognised action.
     system_prompt:
         Optional system-level instruction prepended to every prompt.
-    mlc_backend:
-        Optional :class:`~mlx_agent_rl.core.mlc_backend.MLCBackend` instance.
+    backend:
+        Optional backend instance for batched generation (e.g.
+        :class:`~mlx_agent_rl.core.mlc_backend.MLCBackend` or
+        :class:`~mlx_agent_rl.core.llamacpp_backend.LlamaCppBackend`).
         When provided, all active trajectories at each rollout step are batched
-        together and sent to MLC's continuous-batching engine for faster
+        together and sent to the backend's continuous-batching engine for faster
         generation.  Log-probs are computed in a second pass after all rollouts
         complete.  When ``None`` (the default) the original sequential MLX-LM
         path is used unchanged.
@@ -47,7 +49,7 @@ class RolloutCollector:
         max_tokens: int = 256,
         invalid_action_penalty: float = -0.1,
         system_prompt: str = "",
-        mlc_backend=None,
+        backend=None,
     ) -> None:
         self.policy = policy
         self.env = env
@@ -56,7 +58,7 @@ class RolloutCollector:
         self.max_tokens = max_tokens
         self.invalid_action_penalty = invalid_action_penalty
         self.system_prompt = system_prompt
-        self.mlc_backend = mlc_backend
+        self.backend = backend
 
     # ------------------------------------------------------------------
     # Main API
@@ -73,7 +75,7 @@ class RolloutCollector:
         For each prompt ``group_size`` independent rollouts are collected, all
         sharing the same ``uid`` so advantage estimators can group them.
 
-        When an MLC backend is configured, all active trajectories at each step
+        When a backend is configured, all active trajectories at each step
         are batched together for parallel generation, then log-probs are filled
         in via a second MLX forward pass after the rollout loop completes.
 
@@ -82,8 +84,8 @@ class RolloutCollector:
         list[Trajectory]
             All collected trajectories (``len(prompts) * group_size`` entries).
         """
-        if self.mlc_backend is not None:
-            return self._collect_mlc(prompts, group_size)
+        if self.backend is not None:
+            return self._collect_batched(prompts, group_size)
         return self._collect_sequential(prompts, group_size)
 
     # ------------------------------------------------------------------
@@ -108,13 +110,13 @@ class RolloutCollector:
         return all_trajectories
 
     # ------------------------------------------------------------------
-    # MLC batched path
+    # Batched path (MLC / llama.cpp / any backend with generate_batch_sync)
     # ------------------------------------------------------------------
 
-    def _collect_mlc(
+    def _collect_batched(
         self, prompts: list[dict], group_size: int
     ) -> list[Trajectory]:
-        """Collect rollouts using MLC LLM for batched generation.
+        """Collect rollouts using a batched generation backend.
 
         All active trajectories across all prompts/group-members are batched
         together at each step, then log-probs are computed in a second pass.
@@ -165,8 +167,8 @@ class RolloutCollector:
                     list(self.policy.tokenizer.encode(prompt_text))
                 )
 
-            # Batch generate via MLC (continuous batching, no log_probs yet)
-            batch_outputs: list[str] = self.mlc_backend.generate_batch_sync(
+            # Batch generate via backend (continuous batching, no log_probs yet)
+            batch_outputs: list[str] = self.backend.generate_batch_sync(
                 batch_prompts, max_tokens=self.max_tokens
             )
 

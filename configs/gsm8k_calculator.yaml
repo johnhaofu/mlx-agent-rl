@@ -28,3 +28,8 @@ memory:
 mlc:
   enabled: false
   model_id: "HF://mlc-ai/Qwen2.5-0.5B-Instruct-q4f16_1-MLC"
+llamacpp:
+  enabled: true
+  gguf_path: /Users/junhao/models/Qwen3-0.6B-q4km.gguf
+  port: 8090
+  n_parallel: 16
