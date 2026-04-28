@@ -1,0 +1,159 @@
+"""Rollout collector — runs policy in an environment and builds Trajectory objects."""
+
+from __future__ import annotations
+
+import uuid
+
+from mlx_agent_rl.data.trajectory import Step, Trajectory
+from mlx_agent_rl.environments.base import BaseEnvironment
+from mlx_agent_rl.memory.memory import SlidingMemory
+
+
+class RolloutCollector:
+    """Collects trajectories by running a policy inside an environment.
+
+    Parameters
+    ----------
+    policy:
+        A Policy instance (or any object exposing ``generate_with_log_probs``
+        and ``tokenizer``).
+    env:
+        A :class:`BaseEnvironment` instance.
+    memory:
+        A :class:`SlidingMemory` instance.
+    max_steps:
+        Maximum number of environment steps per episode.
+    max_tokens:
+        Maximum tokens to generate per step.
+    invalid_action_penalty:
+        Reward applied when the model outputs an unrecognised action.
+    system_prompt:
+        Optional system-level instruction prepended to every prompt.
+    """
+
+    def __init__(
+        self,
+        policy,
+        env: BaseEnvironment,
+        memory: SlidingMemory,
+        max_steps: int = 5,
+        max_tokens: int = 256,
+        invalid_action_penalty: float = -0.1,
+        system_prompt: str = "",
+    ) -> None:
+        self.policy = policy
+        self.env = env
+        self.memory = memory
+        self.max_steps = max_steps
+        self.max_tokens = max_tokens
+        self.invalid_action_penalty = invalid_action_penalty
+        self.system_prompt = system_prompt
+
+    # ------------------------------------------------------------------
+    # Main API
+    # ------------------------------------------------------------------
+
+    def collect(
+        self, prompts: list[dict], group_size: int = 4
+    ) -> list[Trajectory]:
+        """Collect rollouts for a list of prompt dicts.
+
+        Each *prompt dict* should have at least a ``"prompt"`` key and optionally
+        an ``"answer"`` key used to score the final answer.
+
+        For each prompt ``group_size`` independent rollouts are collected, all
+        sharing the same ``uid`` so advantage estimators can group them.
+
+        Returns
+        -------
+        list[Trajectory]
+            All collected trajectories (``len(prompts) * group_size`` entries).
+        """
+        all_trajectories: list[Trajectory] = []
+
+        for prompt_dict in prompts:
+            uid = str(uuid.uuid4())
+            question = prompt_dict.get("prompt", "")
+            answer = prompt_dict.get("answer", None)
+
+            for _ in range(group_size):
+                traj = self._run_episode(question, answer, uid)
+                all_trajectories.append(traj)
+
+        return all_trajectories
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_prompt(self, obs_text: str) -> str:
+        """Combine system prompt, memory context, and current observation."""
+        parts: list[str] = []
+        if self.system_prompt:
+            parts.append(self.system_prompt)
+        ctx = self.memory.get_context()
+        if ctx:
+            parts.append(ctx)
+        parts.append(f"Observation: {obs_text}")
+        return "\n".join(parts)
+
+    def _run_episode(
+        self, question: str, answer, uid: str
+    ) -> Trajectory:
+        """Run a single episode and return a :class:`Trajectory`."""
+        self.memory.reset()
+        obs = self.env.reset(question, answer=answer)
+
+        steps: list[Step] = []
+        total_reward = 0.0
+
+        for _ in range(self.max_steps):
+            prompt_text = self._build_prompt(obs.text)
+
+            # Tokenize prompt for storage
+            prompt_tokens: list[int] = list(
+                self.policy.tokenizer.encode(prompt_text)
+            )
+
+            # Generate action
+            model_output, log_probs = self.policy.generate_with_log_probs(
+                prompt_text, max_tokens=self.max_tokens
+            )
+
+            action = self.env.extract_action(model_output)
+
+            # Tokenize the generated text for action_tokens
+            action_tokens: list[int] = list(
+                self.policy.tokenizer.encode(model_output)
+            )
+
+            if action is None:
+                # Invalid action: apply penalty, do not step environment
+                reward = self.invalid_action_penalty
+                done = False
+                obs_text_new = obs.text
+            else:
+                next_obs, reward, done = self.env.step(action)
+                obs_text_new = next_obs.text
+                obs = next_obs
+
+            total_reward += reward
+
+            step = Step(
+                prompt_tokens=prompt_tokens,
+                action_tokens=action_tokens,
+                log_probs=log_probs,
+                reward=reward,
+                done=done,
+                anchor_obs=obs.anchor if hasattr(obs, "anchor") else question,
+            )
+            steps.append(step)
+
+            if done:
+                break
+
+            # Update memory with the action that was taken
+            taken_action = action if action is not None else model_output
+            self.memory.update(obs_text_new, taken_action)
+
+        return Trajectory(steps=steps, episode_reward=total_reward, uid=uid)
