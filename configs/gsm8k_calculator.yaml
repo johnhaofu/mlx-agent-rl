@@ -20,6 +20,7 @@ training:
   batch_size: 4
   epsilon: 0.0001
   epsilon_high: 0.01
+  micro_batch_size: 4  # samples per backward pass (memory cap)
 environment:
   type: calculator
   invalid_action_penalty: -0.1
@@ -29,7 +30,8 @@ mlc:
   enabled: false
   model_id: "HF://mlc-ai/Qwen2.5-0.5B-Instruct-q4f16_1-MLC"
 llamacpp:
-  enabled: true
+  enabled: false
   gguf_path: /Users/junhao/models/Qwen3-0.6B-q4km.gguf
   port: 8090
-  n_parallel: 16
+  n_parallel: 8
+  n_ctx: 16384
