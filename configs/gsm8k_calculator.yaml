@@ -1,0 +1,22 @@
+model:
+  path: /Users/junhao/models/Qwen3-0.6B
+  quantize: 4
+  lora:
+    rank: 8
+    layers: 4
+rollout:
+  group_size: 4
+  max_steps: 5
+  max_tokens: 256
+training:
+  algorithm: dapo
+  lr: 0.000001
+  epochs: 10
+  batch_size: 2
+  epsilon: 0.0001
+  epsilon_high: 0.01
+environment:
+  type: calculator
+  invalid_action_penalty: -0.1
+memory:
+  window_size: 3
