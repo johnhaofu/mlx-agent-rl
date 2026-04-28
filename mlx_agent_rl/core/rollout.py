@@ -161,7 +161,9 @@ class RolloutCollector:
             batch_prompt_tokens: list[list[int]] = []
             for idx in active_indices:
                 slot = slots[idx]
-                prompt_text = self._build_prompt_for(slot["obs"].text, slot["memory"])
+                prompt_text = self._build_prompt_for(
+                    slot["obs"].text, slot["memory"], slot["question"]
+                )
                 batch_prompts.append(prompt_text)
                 batch_prompt_tokens.append(
                     list(self.policy.tokenizer.encode(prompt_text))
@@ -242,12 +244,58 @@ class RolloutCollector:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_prompt(self, obs_text: str) -> str:
-        """Combine system prompt, memory context, and current observation."""
-        return self._build_prompt_for(obs_text, self.memory)
+    def _build_prompt(self, obs_text: str, question: str | None = None) -> str:
+        return self._build_prompt_for(obs_text, self.memory, question)
 
-    def _build_prompt_for(self, obs_text: str, memory: SlidingMemory) -> str:
-        """Build prompt using a specific memory instance."""
+    def _build_prompt_for(
+        self,
+        obs_text: str,
+        memory: SlidingMemory,
+        question: str | None = None,
+    ) -> str:
+        """Build prompt using chat template when the tokenizer supports one.
+
+        Multi-turn structure (preserves the original question across turns):
+            system: <system_prompt>
+            user:   Observation: <question>
+            assistant: <action_1>
+            user:   Observation: <env_response_1>
+            assistant: <action_2>
+            ...
+            user:   Observation: <obs_text>            # current turn input
+        Falls back to plain-text concatenation if no chat template is available.
+        """
+        tokenizer = self.policy.tokenizer
+        if hasattr(tokenizer, "apply_chat_template") and question is not None:
+            messages: list[dict] = []
+            if self.system_prompt:
+                messages.append({"role": "system", "content": self.system_prompt})
+            messages.append({"role": "user", "content": f"Observation: {question}"})
+            history = memory._history[-memory.window_size:] if memory._history else []
+            for resp_obs, action in history:
+                messages.append({"role": "assistant", "content": action})
+                messages.append({"role": "user", "content": f"Observation: {resp_obs}"})
+            # If the current obs hasn't been written into memory yet (it's the
+            # input for *this* turn), the last user message in `messages` is
+            # already the prior env response — but only if memory is non-empty
+            # and obs_text == that response. When memory is empty, current obs
+            # IS the question and was added above. Otherwise current obs equals
+            # the latest memory entry, already present, so no extra append needed.
+            try:
+                return tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            except TypeError:
+                return tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+
+        # Fallback: plain text
         parts: list[str] = []
         if self.system_prompt:
             parts.append(self.system_prompt)
@@ -268,7 +316,7 @@ class RolloutCollector:
         total_reward = 0.0
 
         for _ in range(self.max_steps):
-            prompt_text = self._build_prompt(obs.text)
+            prompt_text = self._build_prompt(obs.text, question=question)
 
             # Tokenize prompt for storage
             prompt_tokens: list[int] = list(
