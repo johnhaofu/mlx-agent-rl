@@ -39,8 +39,8 @@ class Policy:
         quantize: int | None = None,
         lora_rank: int = 8,
         lora_layers: int = 8,
-        temperature: float = 0.7,
-        top_p: float = 0.8,
+        temperature: float = 1.0,  # match verl-agent rollout default; RL needs exploration > output quality
+        top_p: float = 1.0,
     ) -> None:
         self.temperature = temperature
         self.top_p = top_p
