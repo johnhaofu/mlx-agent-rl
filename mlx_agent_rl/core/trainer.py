@@ -340,8 +340,15 @@ class Trainer:
             from mlx_agent_rl.environments.calculator import CalculatorEnvironment
 
             return CalculatorEnvironment()
+        elif env_type == "numberline":
+            from mlx_agent_rl.environments.numberline import NumberLineEnvironment
+
+            return NumberLineEnvironment()
         else:
-            raise ValueError(f"Unknown environment type: {env_type!r}. Choose from: calculator.")
+            raise ValueError(
+                f"Unknown environment type: {env_type!r}. "
+                f"Choose from: calculator, numberline."
+            )
 
     # ------------------------------------------------------------------
     # Training loop

@@ -1,0 +1,45 @@
+model:
+  path: /Users/junhao/models/Qwen3-0.6B
+  quantize: 4
+  lora:
+    rank: 8
+    layers: 4
+rollout:
+  group_size: 4
+  max_steps: 10              # 2 * max_position; matches verl-agent's NumberLineEnv truncation
+  max_tokens: 128            # short turns — model only needs to emit a tool_call
+  system_prompt: |
+    You are playing a number-line game. You see a target number and a current
+    number. Each turn, call the `move` tool with direction='+' to add 1 or '-'
+    to subtract 1 from the current number. Continue until the current number
+    matches the target. You MUST call the move tool every turn.
+training:
+  algorithm: gigpo
+  lr: 0.000005
+  epochs: 5
+  batch_size: 8
+  epsilon: 0.2
+  epsilon_high: 0.28
+  micro_batch_size: 4
+  val_interval: 5
+  val_temperature: 0.4
+  val_top_p: 1.0
+environment:
+  type: numberline
+  invalid_action_penalty: -0.1
+memory:
+  window_size: 3
+mlc:
+  enabled: false
+  model_id: ""
+llamacpp:
+  enabled: false
+  gguf_path: ""
+  port: 8090
+  n_parallel: 8
+  n_ctx: 16384
+wandb:
+  enabled: true
+  project: mlx-agent-rl
+  run_name: numberline_qwen3_06b_gigpo
+  tags: [qwen3-0.6b, gigpo, numberline]

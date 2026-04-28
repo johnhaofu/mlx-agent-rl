@@ -139,6 +139,14 @@ def test_create_environment_calculator():
     assert isinstance(env, CalculatorEnvironment)
 
 
+def test_create_environment_numberline():
+    from mlx_agent_rl.environments.numberline import NumberLineEnvironment
+
+    env_cfg = EnvironmentConfig(type="numberline")
+    env = Trainer._create_environment(env_cfg)
+    assert isinstance(env, NumberLineEnvironment)
+
+
 def test_create_environment_unknown():
     env_cfg = EnvironmentConfig(type="unknown_env")
     with pytest.raises(ValueError, match="Unknown environment type"):
