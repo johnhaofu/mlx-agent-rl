@@ -641,28 +641,32 @@ class Trainer:
         def chunk_loss_sum(model, chunk, ref_chunk):
             """Sum of per-sample losses: PPO-dual-clip + KL(p||ref) + entropy.
 
-            * PPO with asymmetric clip + dual-clip floor (verl `compute_policy_loss`).
-            * KL uses the k3 unbiased estimator (Schulman) against the FROZEN
-              base model, not the rollout-time policy.
-            * Entropy term encourages exploration; coefficient configurable.
-            * Advantage is broadcast across action tokens so each token shares
-              the same scalar advantage — equivalent to verl's outcome-level
-              token-level advantages with a uniform reward distribution.
+            mlx-lm-lora-style ratio convention:
+              ratio = exp(log_p_current - log_p_ref)   # drift from base, NOT from rollout
+            This keeps PPO clip *active* even with ppo_epochs=1, where the
+            verl/standard convention (ratio = current/old_at_rollout) would
+            collapse to 1 and turn the clip into dead code on the first inner
+            update. Using ref_lps as the denominator makes the trust region
+            a global bound on "how far the LoRA has moved the policy from
+            the base model" rather than a per-batch update bound.
+
+            KL uses the k3 unbiased estimator (Schulman) against the same
+            frozen base; advantage is broadcast across action tokens; entropy
+            bonus is the single-sample -log_p estimate.
             """
             loss = mx.array(0.0)
-            for (prompt_toks, action_toks, old_lps_list, adv), ref_lps in zip(
+            for (prompt_toks, action_toks, _old_lps_list, adv), ref_lps in zip(
                 chunk, ref_chunk
             ):
                 new_lps = _compute_log_probs_mx(model, prompt_toks, action_toks)
-                old_lps = mx.array(old_lps_list)
-                min_len = min(new_lps.shape[0], old_lps.shape[0], ref_lps.shape[0])
+                min_len = min(new_lps.shape[0], ref_lps.shape[0])
                 if min_len == 0:
                     continue
                 new_lps = new_lps[:min_len]
-                old_lps = mx.stop_gradient(old_lps[:min_len])
                 ref_l = ref_lps[:min_len]
-                ratio = mx.exp(new_lps - old_lps)
-                adv_arr = mx.array(adv) * mx.ones_like(new_lps)  # broadcast over action tokens
+                # ratio = π_current / π_ref ; PPO clip bounds drift from base
+                ratio = mx.exp(new_lps - ref_l)
+                adv_arr = mx.array(adv) * mx.ones_like(new_lps)
 
                 pg1 = -ratio * adv_arr
                 pg2 = -mx.clip(ratio, 1.0 - eps_low, 1.0 + eps_high) * adv_arr
@@ -675,18 +679,13 @@ class Trainer:
 
                 sample_loss = pg_loss
                 if kl_coef > 0:
-                    # k3 / low_var_kl per Schulman; matches verl-agent's
-                    # ``kl_penalty`` for both names. Clamp to [-10, 10] for
-                    # numerical safety against log_prob outliers.
                     delta = ref_l - new_lps  # log(p_ref / p_new)
                     kl = mx.clip(mx.exp(delta) - delta - 1.0, -10.0, 10.0)
                     sample_loss = sample_loss + kl_coef * kl
                 if entropy_coef > 0:
-                    # Approximate per-token entropy with -new_lps (single-sample
-                    # estimate). Encourages the policy to keep some breadth.
                     sample_loss = sample_loss - entropy_coef * (-new_lps)
 
-                loss = loss + sample_loss.mean()  # token-mean per sample
+                loss = loss + sample_loss.mean()
             return loss
 
         self.policy.train()
