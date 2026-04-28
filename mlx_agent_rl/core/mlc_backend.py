@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+
 
 class MLCBackend:
     """Generation backend using MLC LLM's AsyncMLCEngine.
 
-    MLC LLM supports continuous batching which enables significantly faster
-    parallel generation compared to sequential MLX-LM generation.
+    Runs a persistent event loop in a background thread so the async engine
+    stays alive across multiple generate_batch_sync() calls.
 
     Parameters
     ----------
@@ -17,39 +20,47 @@ class MLCBackend:
     """
 
     def __init__(self, model_id: str) -> None:
-        from mlc_llm import AsyncMLCEngine  # type: ignore
-
         self.model_id = model_id
-        self.engine = AsyncMLCEngine(model_id)
 
-    async def generate_batch(
+        # Create a persistent event loop in a background thread
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+        # Create engine on the background loop
+        self._engine = asyncio.run_coroutine_threadsafe(
+            self._create_engine(), self._loop
+        ).result()
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    async def _create_engine(self):
+        from mlc_llm import AsyncMLCEngine  # type: ignore
+        return AsyncMLCEngine(self.model_id)
+
+    def generate_batch_sync(
         self, prompts: list[str], max_tokens: int = 256
     ) -> list[str]:
         """Generate responses for multiple prompts concurrently.
 
-        Uses ``asyncio.gather`` so all prompts are submitted to the engine's
-        continuous-batching scheduler at once.
-
-        Parameters
-        ----------
-        prompts:
-            List of plain-text prompts to generate from.
-        max_tokens:
-            Maximum new tokens to generate per prompt.
-
-        Returns
-        -------
-        list[str]
-            Generated texts in the same order as *prompts*.
+        Submits all prompts to the MLC engine's continuous-batching scheduler
+        at once via the persistent background event loop.
         """
-        import asyncio
+        future = asyncio.run_coroutine_threadsafe(
+            self._generate_batch(prompts, max_tokens), self._loop
+        )
+        return future.result()
 
+    async def _generate_batch(
+        self, prompts: list[str], max_tokens: int
+    ) -> list[str]:
         tasks = [self._generate_one(p, max_tokens) for p in prompts]
         return await asyncio.gather(*tasks)
 
     async def _generate_one(self, prompt: str, max_tokens: int) -> str:
-        """Generate a single response via the async chat-completions API."""
-        resp = await self.engine.chat.completions.create(
+        resp = await self._engine.chat.completions.create(
             model=self.model_id,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
@@ -58,30 +69,10 @@ class MLCBackend:
         )
         return resp.choices[0].message.content
 
-    def generate_batch_sync(
-        self, prompts: list[str], max_tokens: int = 256
-    ) -> list[str]:
-        """Synchronous wrapper around :meth:`generate_batch`.
-
-        Runs the async coroutine in a new event loop so callers do not need
-        to manage async plumbing.
-
-        Parameters
-        ----------
-        prompts:
-            List of plain-text prompts.
-        max_tokens:
-            Maximum new tokens per prompt.
-
-        Returns
-        -------
-        list[str]
-            Generated texts in the same order as *prompts*.
-        """
-        import asyncio
-
-        return asyncio.run(self.generate_batch(prompts, max_tokens))
-
     def terminate(self) -> None:
-        """Shut down the MLC engine and release resources."""
-        self.engine.terminate()
+        """Shut down the MLC engine and stop the background loop."""
+        asyncio.run_coroutine_threadsafe(
+            self._engine.terminate(), self._loop
+        ).result(timeout=10)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5)

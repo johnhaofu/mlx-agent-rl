@@ -104,7 +104,7 @@ class LlamaCppBackend:
         return asyncio.run(self._generate_batch(prompts, max_tokens))
 
     async def _generate_batch(self, prompts: list[str], max_tokens: int) -> list[str]:
-        url = f"{self.base_url}/v1/chat/completions"
+        url = f"{self.base_url}/v1/completions"
         async with aiohttp.ClientSession() as session:
             tasks = [
                 self._generate_one(session, url, prompt, max_tokens)
@@ -120,12 +120,13 @@ class LlamaCppBackend:
         max_tokens: int,
     ) -> str:
         payload = {
-            "model": "local",
-            "messages": [{"role": "user", "content": prompt}],
+            "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0.8,
             "top_p": 0.95,
         }
         async with session.post(url, json=payload) as resp:
             data = await resp.json()
-            return data["choices"][0]["message"]["content"]
+            if "choices" not in data:
+                raise RuntimeError(f"llama-server error: {data}")
+            return data["choices"][0]["text"]

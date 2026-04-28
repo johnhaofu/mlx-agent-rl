@@ -30,7 +30,9 @@ def load_gsm8k(split: str = "train", max_samples: int = 500) -> list[dict]:
 def main() -> None:
     config_path = sys.argv[1] if len(sys.argv) > 1 else "configs/gsm8k_calculator.yaml"
     config = TrainerConfig.from_yaml(config_path)
-    dataset = load_gsm8k(max_samples=500)
+    max_samples = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+    dataset = load_gsm8k(max_samples=max_samples)
+    print(f"Loaded {len(dataset)} examples", flush=True)
     trainer = Trainer(config=config, dataset=dataset)
     trainer.train()
 
