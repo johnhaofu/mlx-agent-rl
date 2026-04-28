@@ -308,8 +308,18 @@ class Trainer:
                     batch, group_size=cfg.rollout.group_size
                 )
 
-                avg_reward = sum(t.episode_reward for t in trajectories) / len(trajectories)
-                success_rate = sum(1 for t in trajectories if t.succeeded) / len(trajectories)
+                n = len(trajectories)
+                avg_reward = sum(t.episode_reward for t in trajectories) / n
+                # answered = called answer(...) within max_steps (right or wrong)
+                answered_rate = sum(1 for t in trajectories if t.succeeded) / n
+                # correct = at least one step had reward >= 1.0 (calculator env's
+                # answer-correct signal); distinct from answered.
+                correct_rate = (
+                    sum(
+                        1 for t in trajectories
+                        if any(s.reward >= 1.0 for s in t.steps)
+                    ) / n
+                )
 
                 # Compute advantages
                 advantages = self.algorithm.compute(trajectories)
@@ -321,7 +331,9 @@ class Trainer:
 
                 print(
                     f"  [{batch_idx+1}/{num_batches}] "
-                    f"reward={avg_reward:.2f} success={success_rate:.0%} loss={loss:.4f}",
+                    f"reward={avg_reward:.2f} "
+                    f"answered={answered_rate:.0%} correct={correct_rate:.0%} "
+                    f"loss={loss:.4f}",
                     flush=True,
                 )
 
