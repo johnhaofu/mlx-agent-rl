@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import load
 from mlx_lm.generate import generate_step
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
+from mlx_lm.tuner.lora import LoRALinear
 from mlx_lm.tuner.utils import linear_to_lora_layers
 
 
@@ -168,3 +171,39 @@ class Policy:
 
     def eval(self) -> None:
         self.model.eval()
+
+    # ------------------------------------------------------------------
+    # Reference-model context (for KL penalty against frozen base)
+    # ------------------------------------------------------------------
+
+    def _iter_lora_modules(self):
+        """Yield every LoRALinear module in the policy."""
+        stack: list = [self.model]
+        while stack:
+            mod = stack.pop()
+            if isinstance(mod, LoRALinear):
+                yield mod
+            for child in mod.children().values() if hasattr(mod, "children") else []:
+                if isinstance(child, list):
+                    stack.extend(c for c in child if isinstance(c, nn.Module))
+                elif isinstance(child, nn.Module):
+                    stack.append(child)
+
+    @contextlib.contextmanager
+    def reference(self):
+        """Run forward passes inside this block as if LoRA were absent.
+
+        Each LoRALinear's ``scale`` is temporarily set to 0, so the layer
+        returns just the frozen base linear's output. This gives us
+        ``log_prob_under_base_model`` without holding a separate model copy
+        in memory — the cost is one extra forward pass per sample.
+        """
+        modules = list(self._iter_lora_modules())
+        saved = [(m, m.scale) for m in modules]
+        try:
+            for m, _ in saved:
+                m.scale = 0.0
+            yield
+        finally:
+            for m, s in saved:
+                m.scale = s

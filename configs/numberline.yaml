@@ -6,7 +6,7 @@ model:
     layers: 4
 rollout:
   group_size: 4
-  max_steps: 10              # 2 * max_position; matches verl-agent's NumberLineEnv truncation
+  max_steps: 6               # tighter than verl-agent's 2*max_position=10 to fit Mac memory; optimal solution is ≤5 steps
   max_tokens: 128            # short turns — model only needs to emit a tool_call
   system_prompt: |
     You are playing a number-line game. You see a target number and a current
@@ -15,7 +15,7 @@ rollout:
     matches the target. You MUST call the move tool every turn.
 training:
   algorithm: gigpo
-  lr: 0.000005
+  lr: 0.00001          # 1e-5, was 5e-6 (NumberLine plateaued at c~64%, gradient too soft)
   epochs: 5
   batch_size: 8
   epsilon: 0.2
@@ -24,6 +24,14 @@ training:
   val_interval: 5
   val_temperature: 0.4
   val_top_p: 1.0
+  ppo_epochs: 4              # PPO standard: reuse each rollout for 4 update passes
+  kl_coef: 0.02              # KL(current || frozen base) initial weight (adaptive)
+  clip_ratio_c: 3.0          # dual-clip lower bound for negative-advantage steps
+  entropy_coef: 0.001        # small entropy bonus to keep policy from collapsing
+  kl_ctrl_type: adaptive     # auto-tune kl_coef toward kl_target
+  kl_target: 0.01            # observed KL target per update (verl default)
+  kl_horizon: 200            # how fast the controller adapts
+  gigpo_mode: mean_norm      # verl-agent default: subtract mean only, don't divide std
 environment:
   type: numberline
   invalid_action_penalty: -0.1

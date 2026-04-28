@@ -13,8 +13,13 @@ class GRPOEstimator(AdvantageEstimator):
     episode-level advantage.
     """
 
-    def __init__(self, epsilon: float = 1e-4) -> None:
+    def __init__(self, epsilon: float = 1e-4, mode: str = "mean_std_norm") -> None:
         self.epsilon = epsilon
+        if mode not in {"mean_std_norm", "mean_norm"}:
+            raise ValueError(
+                f"Unknown grpo mode: {mode!r}. Choose 'mean_std_norm' or 'mean_norm'."
+            )
+        self.mode = mode
 
     def compute(self, trajectories: list[Trajectory]) -> list[list[float]]:
         # Group trajectories by uid
@@ -35,7 +40,10 @@ class GRPOEstimator(AdvantageEstimator):
         advantages: list[list[float]] = []
         for traj in trajectories:
             mean, std = group_stats[traj.uid]
-            episode_adv = (traj.episode_reward - mean) / (std + self.epsilon)
+            if self.mode == "mean_norm":
+                episode_adv = traj.episode_reward - mean
+            else:
+                episode_adv = (traj.episode_reward - mean) / (std + self.epsilon)
             advantages.append([episode_adv] * traj.total_steps)
 
         return advantages

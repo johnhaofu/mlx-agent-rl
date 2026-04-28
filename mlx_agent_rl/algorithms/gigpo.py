@@ -13,6 +13,14 @@ class GiGPOEstimator(GRPOEstimator):
     trajectories in the same uid group.
 
     Final advantage = episode_adv + step_advantage_w * step_adv
+
+    Parameters
+    ----------
+    mode:
+        ``"mean_std_norm"`` (default) divides by the in-group std for both
+        episode and step advantages. ``"mean_norm"`` only subtracts the mean,
+        matching verl-agent's default GiGPO recipe — more stable when the
+        group has uniform reward (std≈0).
     """
 
     def __init__(
@@ -20,8 +28,9 @@ class GiGPOEstimator(GRPOEstimator):
         epsilon: float = 1e-4,
         step_advantage_w: float = 1.0,
         gamma: float = 0.99,
+        mode: str = "mean_std_norm",
     ) -> None:
-        super().__init__(epsilon=epsilon)
+        super().__init__(epsilon=epsilon, mode=mode)
         self.step_advantage_w = step_advantage_w
         self.gamma = gamma
 
@@ -61,10 +70,13 @@ class GiGPOEstimator(GRPOEstimator):
                 continue
             ret_values = [e[2] for e in entries]
             mean = sum(ret_values) / len(ret_values)
-            variance = sum((r - mean) ** 2 for r in ret_values) / len(ret_values)
-            std = math.sqrt(variance)
             for traj_idx, step_idx, ret in entries:
-                step_advantages[traj_idx][step_idx] = (ret - mean) / (std + self.epsilon)
+                if self.mode == "mean_norm":
+                    step_advantages[traj_idx][step_idx] = ret - mean
+                else:
+                    variance = sum((r - mean) ** 2 for r in ret_values) / len(ret_values)
+                    std = math.sqrt(variance)
+                    step_advantages[traj_idx][step_idx] = (ret - mean) / (std + self.epsilon)
 
         # Combine episode and step advantages
         final_advantages: list[list[float]] = []

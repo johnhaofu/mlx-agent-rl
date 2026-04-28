@@ -22,6 +22,35 @@ from mlx_agent_rl.environments.base import BaseEnvironment
 from mlx_agent_rl.memory.memory import SlidingMemory
 
 
+class AdaptiveKLController:
+    """verl-agent style proportional KL coefficient controller.
+
+    Adjusts ``kl_coef`` to drive the observed KL toward ``target_kl`` over
+    ``horizon`` steps. ``proportional_error`` is clipped to ±0.2 to prevent
+    runaway swings on a single noisy KL estimate.
+    """
+
+    def __init__(self, init_kl_coef: float, target_kl: float, horizon: int) -> None:
+        self.value = init_kl_coef
+        self.target = target_kl
+        self.horizon = horizon
+
+    def update(self, current_kl: float, n_steps: int) -> None:
+        proportional_error = max(-0.2, min(0.2, current_kl / self.target - 1))
+        mult = 1 + proportional_error * n_steps / self.horizon
+        self.value *= mult
+
+
+class FixedKLController:
+    """Constant kl_coef; the trivial controller."""
+
+    def __init__(self, init_kl_coef: float) -> None:
+        self.value = init_kl_coef
+
+    def update(self, current_kl: float, n_steps: int) -> None:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Config dataclasses
 # ---------------------------------------------------------------------------
@@ -51,11 +80,19 @@ class TrainingConfig:
     batch_size: int = 4
     epsilon: float = 0.2
     epsilon_high: float = 0.28
-    clip_grad: float = 1.0
+    clip_grad: float = 1.0  # max global L2 norm of LoRA gradients per update
     micro_batch_size: int = 4  # samples per backward pass; controls peak memory
     val_interval: int = 5  # run val eval every N train batches (0 disables)
     val_temperature: float = 0.4  # low-variance sampling for val (not greedy)
     val_top_p: float = 1.0
+    ppo_epochs: int = 4  # number of update passes over each rollout batch
+    kl_coef: float = 0.05  # initial KL(current || reference) penalty weight (0 disables)
+    clip_ratio_c: float = 3.0  # dual-clip lower bound for negative-advantage steps
+    entropy_coef: float = 0.0  # weight on entropy bonus (0 disables)
+    kl_ctrl_type: str = "fixed"  # 'fixed' or 'adaptive'
+    kl_target: float = 0.01  # target KL when kl_ctrl_type='adaptive'
+    kl_horizon: int = 10000  # adaptation horizon for the adaptive controller
+    gigpo_mode: str = "mean_std_norm"  # 'mean_std_norm' (default) or 'mean_norm'
 
 
 @dataclass
@@ -153,6 +190,14 @@ class TrainerConfig:
                 val_interval=t.get("val_interval", 5),
                 val_temperature=t.get("val_temperature", 0.4),
                 val_top_p=t.get("val_top_p", 1.0),
+                ppo_epochs=t.get("ppo_epochs", 4),
+                kl_coef=t.get("kl_coef", 0.05),
+                clip_ratio_c=t.get("clip_ratio_c", 3.0),
+                entropy_coef=t.get("entropy_coef", 0.0),
+                kl_ctrl_type=t.get("kl_ctrl_type", "fixed"),
+                kl_target=t.get("kl_target", 0.01),
+                kl_horizon=t.get("kl_horizon", 10000),
+                gigpo_mode=t.get("gigpo_mode", "mean_std_norm"),
             )
 
         if "environment" in raw:
@@ -242,6 +287,7 @@ class Trainer:
             config.training.algorithm,
             epsilon=config.training.epsilon,
             epsilon_high=config.training.epsilon_high,
+            gigpo_mode=config.training.gigpo_mode,
         )
         # Optionally create a batched generation backend.
         # llama.cpp takes priority over MLC when both are enabled.
@@ -273,6 +319,23 @@ class Trainer:
 
         # Optimizer — only update LoRA parameters
         self.optimizer = optim.Adam(learning_rate=config.training.lr)
+
+        # KL coefficient controller (constant or proportional/adaptive).
+        if config.training.kl_ctrl_type == "adaptive":
+            self._kl_ctrl: AdaptiveKLController | FixedKLController | None = (
+                AdaptiveKLController(
+                    init_kl_coef=config.training.kl_coef,
+                    target_kl=config.training.kl_target,
+                    horizon=config.training.kl_horizon,
+                )
+            )
+        elif config.training.kl_ctrl_type == "fixed":
+            self._kl_ctrl = FixedKLController(init_kl_coef=config.training.kl_coef)
+        else:
+            raise ValueError(
+                f"Unknown kl_ctrl_type: {config.training.kl_ctrl_type!r}. "
+                f"Choose 'fixed' or 'adaptive'."
+            )
 
         # Optional W&B logging. Initialized lazily so that pure-test imports
         # don't pull wandb or trigger network calls.
@@ -315,6 +378,7 @@ class Trainer:
         name = name.lower()
         epsilon_clip = kwargs.get("epsilon", 0.2)
         epsilon_high = kwargs.get("epsilon_high", 0.28)
+        gigpo_mode = kwargs.get("gigpo_mode", "mean_std_norm")
         norm_eps = 1e-4  # for std denominator stability, NOT PPO clip
 
         if name == "grpo":
@@ -328,7 +392,7 @@ class Trainer:
                 epsilon_high=epsilon_high,
             )
         elif name == "gigpo":
-            return GiGPOEstimator(epsilon=norm_eps)
+            return GiGPOEstimator(epsilon=norm_eps, mode=gigpo_mode)
         else:
             raise ValueError(f"Unknown algorithm: {name!r}. Choose from grpo, dr_grpo, dapo, gigpo.")
 
@@ -417,19 +481,19 @@ class Trainer:
                 )
 
                 if self._wandb is not None:
-                    self._wandb.log(
-                        {
-                            "train/reward": avg_reward,
-                            "train/answered": answered_rate,
-                            "train/correct": correct_rate,
-                            "train/loss": loss,
-                            "train/ma_reward": rw_r,
-                            "train/ma_answered": rw_a,
-                            "train/ma_correct": rw_c,
-                            "train/epoch": epoch + 1,
-                        },
-                        step=global_step,
-                    )
+                    payload = {
+                        "train/reward": avg_reward,
+                        "train/answered": answered_rate,
+                        "train/correct": correct_rate,
+                        "train/loss": loss,
+                        "train/ma_reward": rw_r,
+                        "train/ma_answered": rw_a,
+                        "train/ma_correct": rw_c,
+                        "train/epoch": epoch + 1,
+                    }
+                    if self._kl_ctrl is not None:
+                        payload["train/kl_coef"] = self._kl_ctrl.value
+                    self._wandb.log(payload, step=global_step)
 
                 if (
                     self.val_dataset is not None
@@ -542,61 +606,142 @@ class Trainer:
             return 0.0
 
         from mlx.utils import tree_map
+        from mlx.optimizers import clip_grad_norm
 
+        cfg = self.config.training
         n_samples = len(samples)
-        micro_bs = max(1, self.config.training.micro_batch_size)
+        micro_bs = max(1, cfg.micro_batch_size)
+        kl_coef = self._kl_ctrl.value if self._kl_ctrl is not None else cfg.kl_coef
+        clip_ratio_c = cfg.clip_ratio_c
+        clip_grad = cfg.clip_grad
+        entropy_coef = cfg.entropy_coef
 
-        def chunk_loss_sum(model, chunk):
-            """Sum (not mean) of per-sample PPO-clip losses for a chunk."""
+        # ----- Compute frozen-reference log probs once for this batch ----- #
+        # The reference is the base model (LoRA scale=0). KL keeps the policy
+        # within a global trust region of the initial model — without this
+        # we observed empirical collapse around batch 18 of the Calculator
+        # and NumberLine runs.
+        ref_lps_per_sample: list[mx.array] = []
+        self.policy.eval()
+        with self.policy.reference():
+            for prompt_toks, action_toks, _old_lps_list, _adv in samples:
+                rl = _compute_log_probs_mx(self.policy.model, prompt_toks, action_toks)
+                mx.eval(rl)
+                ref_lps_per_sample.append(mx.stop_gradient(rl))
+
+        def chunk_loss_sum(model, chunk, ref_chunk):
+            """Sum of per-sample losses: PPO-dual-clip + KL(p||ref) + entropy.
+
+            * PPO with asymmetric clip + dual-clip floor (verl `compute_policy_loss`).
+            * KL uses the k3 unbiased estimator (Schulman) against the FROZEN
+              base model, not the rollout-time policy.
+            * Entropy term encourages exploration; coefficient configurable.
+            * Advantage is broadcast across action tokens so each token shares
+              the same scalar advantage — equivalent to verl's outcome-level
+              token-level advantages with a uniform reward distribution.
+            """
             loss = mx.array(0.0)
-            for prompt_toks, action_toks, old_lps_list, adv in chunk:
+            for (prompt_toks, action_toks, old_lps_list, adv), ref_lps in zip(
+                chunk, ref_chunk
+            ):
                 new_lps = _compute_log_probs_mx(model, prompt_toks, action_toks)
                 old_lps = mx.array(old_lps_list)
-                min_len = min(new_lps.shape[0], old_lps.shape[0])
+                min_len = min(new_lps.shape[0], old_lps.shape[0], ref_lps.shape[0])
                 if min_len == 0:
                     continue
                 new_lps = new_lps[:min_len]
                 old_lps = mx.stop_gradient(old_lps[:min_len])
+                ref_l = ref_lps[:min_len]
                 ratio = mx.exp(new_lps - old_lps)
-                adv_arr = mx.array(adv)
-                clipped = mx.clip(ratio, 1.0 - eps_low, 1.0 + eps_high)
-                loss = loss + (-mx.minimum(ratio * adv_arr, clipped * adv_arr)).mean()
+                adv_arr = mx.array(adv) * mx.ones_like(new_lps)  # broadcast over action tokens
+
+                pg1 = -ratio * adv_arr
+                pg2 = -mx.clip(ratio, 1.0 - eps_low, 1.0 + eps_high) * adv_arr
+                pg_max = mx.maximum(pg1, pg2)
+                if adv < 0:
+                    upper = -clip_ratio_c * adv_arr
+                    pg_loss = mx.minimum(pg_max, upper)
+                else:
+                    pg_loss = pg_max
+
+                sample_loss = pg_loss
+                if kl_coef > 0:
+                    delta = ref_l - new_lps  # log(p_ref / p_new)
+                    kl = mx.exp(delta) - delta - 1.0
+                    sample_loss = sample_loss + kl_coef * kl
+                if entropy_coef > 0:
+                    # Approximate per-token entropy with -new_lps (single-sample
+                    # estimate). Encourages the policy to keep some breadth.
+                    sample_loss = sample_loss - entropy_coef * (-new_lps)
+
+                loss = loss + sample_loss.mean()  # token-mean per sample
             return loss
 
         self.policy.train()
+        total_loss = 0.0
+        total_kl = 0.0
+        n_updates = 0
 
-        # Accumulate gradients across micro-batches. Each micro-batch is its own
-        # autograd graph that gets evaluated and freed before the next one starts,
-        # bounding peak activation memory to ~micro_bs sequences worth of layers.
-        accumulated_grads = None
-        total_loss_sum = 0.0
-        for start in range(0, n_samples, micro_bs):
-            chunk = samples[start : start + micro_bs]
+        # Multi-epoch PPO update: reuse the same rollout (and the frozen
+        # ref_lps cached above) for several gradient passes.
+        for _ppo_epoch in range(cfg.ppo_epochs):
+            accumulated_grads = None
+            epoch_loss_sum = 0.0
+            for start in range(0, n_samples, micro_bs):
+                chunk = samples[start : start + micro_bs]
+                ref_chunk = ref_lps_per_sample[start : start + micro_bs]
 
-            def fn(model, chunk=chunk):
-                return chunk_loss_sum(model, chunk)
+                def fn(model, chunk=chunk, ref_chunk=ref_chunk):
+                    return chunk_loss_sum(model, chunk, ref_chunk)
 
-            chunk_loss, chunk_grads = nn.value_and_grad(self.policy.model, fn)(
-                self.policy.model
-            )
-            mx.eval(chunk_loss, chunk_grads)
-            total_loss_sum += float(chunk_loss)
-
-            if accumulated_grads is None:
-                accumulated_grads = chunk_grads
-            else:
-                accumulated_grads = tree_map(
-                    lambda a, g: a + g, accumulated_grads, chunk_grads
+                chunk_loss, chunk_grads = nn.value_and_grad(self.policy.model, fn)(
+                    self.policy.model
                 )
-            mx.eval(accumulated_grads)
+                mx.eval(chunk_loss, chunk_grads)
+                epoch_loss_sum += float(chunk_loss)
 
-        # Match the original mean-over-samples reduction.
-        final_grads = tree_map(lambda g: g / n_samples, accumulated_grads)
-        self.optimizer.update(self.policy.model, final_grads)
-        mx.eval(self.policy.model.parameters(), self.optimizer.state)
+                if accumulated_grads is None:
+                    accumulated_grads = chunk_grads
+                else:
+                    accumulated_grads = tree_map(
+                        lambda a, g: a + g, accumulated_grads, chunk_grads
+                    )
+                mx.eval(accumulated_grads)
+
+            final_grads = tree_map(lambda g: g / n_samples, accumulated_grads)
+            if clip_grad and clip_grad > 0:
+                final_grads, _gnorm = clip_grad_norm(final_grads, clip_grad)
+            self.optimizer.update(self.policy.model, final_grads)
+            mx.eval(self.policy.model.parameters(), self.optimizer.state)
+
+            total_loss += epoch_loss_sum / n_samples
+            n_updates += 1
+
+        # Estimate observed KL post-update for the adaptive controller.
+        # MLX's value_and_grad API only computes gradients when called via
+        # nn.value_and_grad(...), so a plain forward here doesn't accumulate
+        # any graph — we just need mx.eval() to materialize the tensor.
+        if self._kl_ctrl is not None:
+            kls = []
+            for (prompt_toks, action_toks, _ol, _adv), ref_lps in zip(
+                samples, ref_lps_per_sample
+            ):
+                new_lps = _compute_log_probs_mx(
+                    self.policy.model, prompt_toks, action_toks
+                )
+                n = min(new_lps.shape[0], ref_lps.shape[0])
+                if n == 0:
+                    continue
+                delta = (ref_lps[:n] - new_lps[:n])
+                kl = (mx.exp(delta) - delta - 1.0).mean()
+                mx.eval(kl)
+                kls.append(float(kl))
+            if kls:
+                total_kl = sum(kls) / len(kls)
+                self._kl_ctrl.update(total_kl, n_steps=1)
+
         self.policy.eval()
-
-        return total_loss_sum / n_samples
+        return total_loss / max(n_updates, 1)
 
 
 # ---------------------------------------------------------------------------
