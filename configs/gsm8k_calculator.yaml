@@ -14,13 +14,16 @@ rollout:
     Do NOT write the answer in plain text or in a \boxed{} — the task is only
     considered complete when the `answer` tool is called.
 training:
-  algorithm: dapo
-  lr: 0.000001
+  algorithm: gigpo
+  lr: 0.000005          # 5e-6 (was 1e-6 — too small to move policy)
   epochs: 10
-  batch_size: 4
-  epsilon: 0.0001
-  epsilon_high: 0.01
-  micro_batch_size: 4  # samples per backward pass (memory cap)
+  batch_size: 8         # 4→8: half the per-batch metric variance (√2)
+  epsilon: 0.2          # DAPO/PPO standard low-side clip (was 0.0001 — effectively no clip room)
+  epsilon_high: 0.28    # DAPO recommended high-side clip (was 0.01)
+  micro_batch_size: 4   # samples per backward pass (memory cap)
+  val_interval: 5       # run val eval every N train batches
+  val_temperature: 0.4  # low-variance sampling for val (matches verl-agent)
+  val_top_p: 1.0
 environment:
   type: calculator
   invalid_action_penalty: -0.1
@@ -35,3 +38,8 @@ llamacpp:
   port: 8090
   n_parallel: 8
   n_ctx: 16384
+wandb:
+  enabled: true
+  project: mlx-agent-rl
+  run_name: gsm8k_qwen3_06b_gigpo
+  tags: [qwen3-0.6b, gigpo, gsm8k, calculator]

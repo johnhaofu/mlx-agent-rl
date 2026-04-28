@@ -2,11 +2,26 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 
 from mlx_agent_rl.data.trajectory import Step, Trajectory
 from mlx_agent_rl.environments.base import BaseEnvironment
 from mlx_agent_rl.memory.memory import SlidingMemory
+
+
+_TOOL_CALL_BLOCK = re.compile(r"<tool_call>\s*\{.*?\}\s*</tool_call>", re.DOTALL)
+
+
+def _strip_to_tool_call(model_output: str) -> str:
+    """Reduce assistant output stored in chat history to just the <tool_call>
+    block. Qwen3's best-practice docs say multi-turn history should contain
+    only the final output, not thinking/reasoning prose. When no tool_call
+    block is present (invalid action) we keep the original output so the
+    model still sees its own malformed attempt as feedback context.
+    """
+    m = _TOOL_CALL_BLOCK.search(model_output)
+    return m.group(0) if m else model_output
 
 
 class RolloutCollector:
@@ -220,9 +235,9 @@ class RolloutCollector:
                 if done:
                     slot["done"] = True
                 else:
-                    # Store the full model output so chat replay sees the
-                    # actual <tool_call> tokens the model emitted.
-                    slot["memory"].update(new_obs_text, model_output)
+                    slot["memory"].update(
+                        new_obs_text, _strip_to_tool_call(model_output)
+                    )
 
         # ----------------------------------------------------------------
         # Second pass: compute log_probs for every step via MLX policy
@@ -365,7 +380,6 @@ class RolloutCollector:
             if done:
                 break
 
-            # Store full model output so chat replay sees the <tool_call> tokens.
-            self.memory.update(obs_text_new, model_output)
+            self.memory.update(obs_text_new, _strip_to_tool_call(model_output))
 
         return Trajectory(steps=steps, episode_reward=total_reward, uid=uid)

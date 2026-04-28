@@ -53,6 +53,9 @@ class TrainingConfig:
     epsilon_high: float = 0.28
     clip_grad: float = 1.0
     micro_batch_size: int = 4  # samples per backward pass; controls peak memory
+    val_interval: int = 5  # run val eval every N train batches (0 disables)
+    val_temperature: float = 0.4  # low-variance sampling for val (not greedy)
+    val_top_p: float = 1.0
 
 
 @dataclass
@@ -73,6 +76,14 @@ class MLCConfig:
 
 
 @dataclass
+class WandbConfig:
+    enabled: bool = False
+    project: str = "mlx-agent-rl"
+    run_name: str | None = None
+    tags: list[str] = field(default_factory=list)
+
+
+@dataclass
 class LlamaCppConfig:
     enabled: bool = False
     gguf_path: str = ""
@@ -90,6 +101,7 @@ class TrainerConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     mlc: MLCConfig = field(default_factory=MLCConfig)
     llamacpp: LlamaCppConfig = field(default_factory=LlamaCppConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
 
     # ------------------------------------------------------------------
     # Factory
@@ -138,6 +150,9 @@ class TrainerConfig:
                 epsilon_high=t.get("epsilon_high", 0.28),
                 clip_grad=t.get("clip_grad", 1.0),
                 micro_batch_size=t.get("micro_batch_size", 4),
+                val_interval=t.get("val_interval", 5),
+                val_temperature=t.get("val_temperature", 0.4),
+                val_top_p=t.get("val_top_p", 1.0),
             )
 
         if "environment" in raw:
@@ -173,6 +188,15 @@ class TrainerConfig:
                 n_ctx=lc.get("n_ctx", 16384),
             )
 
+        if "wandb" in raw:
+            wb = raw["wandb"]
+            cfg.wandb = WandbConfig(
+                enabled=wb.get("enabled", False),
+                project=wb.get("project", "mlx-agent-rl"),
+                run_name=wb.get("run_name", None),
+                tags=wb.get("tags", []),
+            )
+
         return cfg
 
 
@@ -192,9 +216,15 @@ class Trainer:
         List of dicts with ``"prompt"`` (and optional ``"answer"``) keys.
     """
 
-    def __init__(self, config: TrainerConfig, dataset: list[dict]) -> None:
+    def __init__(
+        self,
+        config: TrainerConfig,
+        dataset: list[dict],
+        val_dataset: list[dict] | None = None,
+    ) -> None:
         self.config = config
         self.dataset = dataset
+        self.val_dataset = val_dataset
 
         # Build components
         from mlx_agent_rl.core.policy import Policy
@@ -244,29 +274,61 @@ class Trainer:
         # Optimizer — only update LoRA parameters
         self.optimizer = optim.Adam(learning_rate=config.training.lr)
 
+        # Optional W&B logging. Initialized lazily so that pure-test imports
+        # don't pull wandb or trigger network calls.
+        self._wandb = None
+        if config.wandb.enabled:
+            try:
+                import wandb  # type: ignore
+            except ImportError as exc:
+                raise ImportError(
+                    "wandb.enabled=true but the wandb package is not installed."
+                ) from exc
+            wandb.init(
+                project=config.wandb.project,
+                name=config.wandb.run_name,
+                tags=config.wandb.tags,
+                config={
+                    "model": config.model.__dict__,
+                    "rollout": config.rollout.__dict__,
+                    "training": config.training.__dict__,
+                    "environment": config.environment.__dict__,
+                    "memory": config.memory.__dict__,
+                },
+            )
+            self._wandb = wandb
+
     # ------------------------------------------------------------------
     # Static factories
     # ------------------------------------------------------------------
 
     @staticmethod
     def _create_algorithm(name: str, **kwargs) -> AdvantageEstimator:
-        """Instantiate an advantage estimator by name."""
+        """Instantiate an advantage estimator by name.
+
+        Note: ``epsilon`` in the YAML config is the **PPO-clip** epsilon used in
+        the policy update. The advantage-normalization epsilon (denominator
+        stabilizer in (r - mean) / (std + eps)) is a separate, much smaller
+        constant — exposing the same name for both would conflate two unrelated
+        quantities, so we hard-code the normalization eps here.
+        """
         name = name.lower()
-        epsilon = kwargs.get("epsilon", 0.2)
+        epsilon_clip = kwargs.get("epsilon", 0.2)
         epsilon_high = kwargs.get("epsilon_high", 0.28)
+        norm_eps = 1e-4  # for std denominator stability, NOT PPO clip
 
         if name == "grpo":
-            return GRPOEstimator(epsilon=epsilon)
+            return GRPOEstimator(epsilon=norm_eps)
         elif name == "dr_grpo":
             return DrGRPOEstimator()
         elif name == "dapo":
             return DAPOEstimator(
-                epsilon=epsilon,
-                epsilon_low=epsilon,
+                epsilon=norm_eps,
+                epsilon_low=epsilon_clip,
                 epsilon_high=epsilon_high,
             )
         elif name == "gigpo":
-            return GiGPOEstimator(epsilon=epsilon)
+            return GiGPOEstimator(epsilon=norm_eps)
         else:
             raise ValueError(f"Unknown algorithm: {name!r}. Choose from grpo, dr_grpo, dapo, gigpo.")
 
@@ -287,8 +349,12 @@ class Trainer:
 
     def train(self) -> None:
         """Main training loop."""
+        from collections import deque
+
         cfg = self.config
         self.policy.train()
+        rolling_window = 10
+        rolling = deque(maxlen=rolling_window)  # tuples (reward, answered, correct)
 
         for epoch in range(cfg.training.epochs):
             shuffled = list(self.dataset)
@@ -321,6 +387,11 @@ class Trainer:
                     ) / n
                 )
 
+                rolling.append((avg_reward, answered_rate, correct_rate))
+                rw_r = sum(x[0] for x in rolling) / len(rolling)
+                rw_a = sum(x[1] for x in rolling) / len(rolling)
+                rw_c = sum(x[2] for x in rolling) / len(rolling)
+
                 # Compute advantages
                 advantages = self.algorithm.compute(trajectories)
 
@@ -329,16 +400,100 @@ class Trainer:
                 total_loss += loss
                 num_updates += 1
 
+                global_step = epoch * num_batches + batch_idx + 1
                 print(
                     f"  [{batch_idx+1}/{num_batches}] "
-                    f"reward={avg_reward:.2f} "
-                    f"answered={answered_rate:.0%} correct={correct_rate:.0%} "
+                    f"r={avg_reward:+.2f} a={answered_rate:.0%} c={correct_rate:.0%} "
+                    f"| ma{len(rolling)}: r={rw_r:+.2f} a={rw_a:.0%} c={rw_c:.0%} "
                     f"loss={loss:.4f}",
                     flush=True,
                 )
 
+                if self._wandb is not None:
+                    self._wandb.log(
+                        {
+                            "train/reward": avg_reward,
+                            "train/answered": answered_rate,
+                            "train/correct": correct_rate,
+                            "train/loss": loss,
+                            "train/ma_reward": rw_r,
+                            "train/ma_answered": rw_a,
+                            "train/ma_correct": rw_c,
+                            "train/epoch": epoch + 1,
+                        },
+                        step=global_step,
+                    )
+
+                if (
+                    self.val_dataset is not None
+                    and cfg.training.val_interval > 0
+                    and global_step % cfg.training.val_interval == 0
+                ):
+                    self._evaluate(global_step)
+
             avg_loss = total_loss / max(num_updates, 1)
             print(f"Epoch {epoch + 1}/{cfg.training.epochs}  avg_loss={avg_loss:.4f}", flush=True)
+
+    # ------------------------------------------------------------------
+    # Validation eval (low-variance sampling, group_size=1, no policy update)
+    # ------------------------------------------------------------------
+
+    def _evaluate(self, global_step: int) -> None:
+        """Run a held-out evaluation pass and print val metrics.
+
+        Uses low-variance sampling (val_temperature, default 0.4) and
+        group_size=1 so each val problem yields exactly one trajectory.
+        Following verl-agent's convention, val is sampling-based but with
+        lower temperature than training, giving a smoother trend curve
+        than the per-batch RL metrics without committing to fully greedy
+        decoding (which often degrades into repetition for small models).
+        """
+        cfg = self.config.training
+        if not self.val_dataset:
+            return
+
+        old_temp = self.policy.temperature
+        old_top_p = self.policy.top_p
+        self.policy.temperature = cfg.val_temperature
+        self.policy.top_p = cfg.val_top_p
+        self.policy.eval()
+        try:
+            trajectories = self.collector.collect(self.val_dataset, group_size=1)
+        finally:
+            self.policy.temperature = old_temp
+            self.policy.top_p = old_top_p
+            self.policy.train()
+
+        n = len(trajectories)
+        if n == 0:
+            return
+        avg_reward = sum(t.episode_reward for t in trajectories) / n
+        answered_rate = sum(1 for t in trajectories if t.succeeded) / n
+        correct_rate = (
+            sum(
+                1 for t in trajectories
+                if any(s.reward >= 1.0 for s in t.steps)
+            ) / n
+        )
+        avg_steps = sum(t.total_steps for t in trajectories) / n
+        print(
+            f"  [val @ step {global_step}] r={avg_reward:+.2f} "
+            f"a={answered_rate:.0%} c={correct_rate:.0%} "
+            f"avg_steps={avg_steps:.1f}  (n={n})",
+            flush=True,
+        )
+
+        if self._wandb is not None:
+            self._wandb.log(
+                {
+                    "val/reward": avg_reward,
+                    "val/answered": answered_rate,
+                    "val/correct": correct_rate,
+                    "val/avg_steps": avg_steps,
+                    "val/n": n,
+                },
+                step=global_step,
+            )
 
     # ------------------------------------------------------------------
     # Policy update (PPO-clip)
