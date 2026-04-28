@@ -204,6 +204,12 @@ class RolloutCollector:
                 action_tokens: list[int] = list(
                     self.policy.tokenizer.encode(model_output)
                 )
+                # Snapshot anchor BEFORE env.step mutates the slot's obs.
+                current_anchor = (
+                    slot["obs"].anchor
+                    if hasattr(slot["obs"], "anchor")
+                    else slot["question"]
+                )
 
                 if action is None:
                     reward = self.invalid_action_penalty
@@ -226,9 +232,7 @@ class RolloutCollector:
                     log_probs=[],  # placeholder; filled in second pass below
                     reward=reward,
                     done=done,
-                    anchor_obs=slot["obs"].anchor
-                    if hasattr(slot["obs"], "anchor")
-                    else slot["question"],
+                    anchor_obs=current_anchor,
                 )
                 slot["steps"].append(step)
 
@@ -351,6 +355,12 @@ class RolloutCollector:
 
             action = self.env.extract_action(model_output)
 
+            # GiGPO step-level groups peers that took an action *from the
+            # same state*. Snapshot the anchor BEFORE we mutate ``obs``
+            # via env.step — otherwise we'd group on the next state, which
+            # silently splits same-start peers into different groups.
+            current_anchor = obs.anchor if hasattr(obs, "anchor") else question
+
             if action is None:
                 # Invalid action: apply penalty, do not step environment
                 reward = self.invalid_action_penalty
@@ -372,7 +382,7 @@ class RolloutCollector:
                 log_probs=log_probs,
                 reward=reward,
                 done=done,
-                anchor_obs=obs.anchor if hasattr(obs, "anchor") else question,
+                anchor_obs=current_anchor,
             )
             steps.append(step)
 
