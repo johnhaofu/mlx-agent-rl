@@ -96,7 +96,7 @@ class NumberLineEnvironment(BaseEnvironment):
         return Observation(
             text=self._format_obs(),
             done=False,
-            anchor=self._format_obs(),
+            anchor=self._format_anchor(),
         )
 
     def step(self, action: str) -> tuple[Observation, float, bool]:
@@ -115,6 +115,7 @@ class NumberLineEnvironment(BaseEnvironment):
             obs = Observation(
                 text=f"Error: unknown direction {action!r}. Use '+' or '-'.",
                 done=False,
+                anchor=self._format_anchor(),
             )
             return obs, 0.0, False
 
@@ -131,7 +132,15 @@ class NumberLineEnvironment(BaseEnvironment):
         if not done and self._steps >= 2 * self.max_position:
             done = True  # truncation
 
-        return Observation(text=self._format_obs(), done=done), reward, done
+        return (
+            Observation(
+                text=self._format_obs(),
+                done=done,
+                anchor=self._format_anchor(),
+            ),
+            reward,
+            done,
+        )
 
     def extract_action(self, model_output: str) -> str | None:
         """Parse a <tool_call>{"name":"move","arguments":{"direction":"+"}}</tool_call>.
@@ -170,3 +179,10 @@ class NumberLineEnvironment(BaseEnvironment):
 
     def _format_obs(self) -> str:
         return f"Target number: {self._goal}. Current number: {self._position}"
+
+    def _format_anchor(self) -> str:
+        """Anchor is just the (position, goal) state — used by GiGPO to group
+        peer steps across trajectories that arrived at the same state. Without
+        a meaningful anchor, every turn-2+ step would land in a single empty
+        group and step-level advantages would be uninformative."""
+        return f"pos={self._position}|goal={self._goal}"
