@@ -10,6 +10,11 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+from mlx_lm.models.cache import (
+    can_trim_prompt_cache,
+    make_prompt_cache,
+    trim_prompt_cache,
+)
 
 from mlx_agent_rl.algorithms.base import AdvantageEstimator
 from mlx_agent_rl.algorithms.dapo import DAPOEstimator
@@ -70,6 +75,7 @@ class RolloutConfig:
     max_steps: int = 5
     max_tokens: int = 256
     system_prompt: str = ""
+    enable_thinking: bool = False  # Qwen3 reasoning <think>...</think> mode
 
 
 @dataclass
@@ -100,6 +106,9 @@ class TrainingConfig:
 class EnvironmentConfig:
     type: str = "calculator"
     invalid_action_penalty: float = -0.1
+    base_url: str | None = None  # WebShop sidecar URL when type=='webshop'
+    use_tools_schema: bool = True  # WebShop: pass tools to chat template (Qwen3 native)
+    dense_reward: bool = False  # WebShop: use continuous task_score instead of binary won
 
 
 @dataclass
@@ -175,6 +184,7 @@ class TrainerConfig:
                 max_steps=r.get("max_steps", 5),
                 max_tokens=r.get("max_tokens", 256),
                 system_prompt=r.get("system_prompt", ""),
+                enable_thinking=r.get("enable_thinking", False),
             )
 
         if "training" in raw:
@@ -207,6 +217,9 @@ class TrainerConfig:
             cfg.environment = EnvironmentConfig(
                 type=e.get("type", "calculator"),
                 invalid_action_penalty=e.get("invalid_action_penalty", -0.1),
+                base_url=e.get("base_url", None),
+                use_tools_schema=e.get("use_tools_schema", True),
+                dense_reward=e.get("dense_reward", False),
             )
 
         if "memory" in raw:
@@ -317,6 +330,7 @@ class Trainer:
             invalid_action_penalty=config.environment.invalid_action_penalty,
             system_prompt=config.rollout.system_prompt,
             backend=rollout_backend,
+            enable_thinking=config.rollout.enable_thinking,
         )
 
         # Optimizer — only update LoRA parameters
@@ -410,10 +424,19 @@ class Trainer:
             from mlx_agent_rl.environments.numberline import NumberLineEnvironment
 
             return NumberLineEnvironment()
+        elif env_type == "webshop":
+            from mlx_agent_rl.environments.webshop import WebShopEnvironment
+
+            base_url = getattr(config, "base_url", None) or "http://192.168.0.117:3001"
+            return WebShopEnvironment(
+                base_url=base_url,
+                use_tools_schema=getattr(config, "use_tools_schema", True),
+                dense_reward=getattr(config, "dense_reward", False),
+            )
         else:
             raise ValueError(
                 f"Unknown environment type: {env_type!r}. "
-                f"Choose from: calculator, numberline."
+                f"Choose from: calculator, numberline, webshop."
             )
 
     # ------------------------------------------------------------------
@@ -466,6 +489,8 @@ class Trainer:
                         if any(s.reward >= 1.0 for s in t.steps)
                     ) / n
                 )
+                task_score = _mean_last_step_metric(trajectories, "task_score")
+                won_rate = _mean_last_step_metric(trajectories, "won")
 
                 rolling.append((avg_reward, answered_rate, correct_rate))
                 rw_r = sum(x[0] for x in rolling) / len(rolling)
@@ -499,6 +524,8 @@ class Trainer:
                         "train/ma_answered": rw_a,
                         "train/ma_correct": rw_c,
                         "train/epoch": epoch + 1,
+                        "train/task_score": task_score,
+                        "train/won": won_rate,
                     }
                     if self._kl_ctrl is not None:
                         payload["train/kl_coef"] = self._kl_ctrl.value
@@ -556,9 +583,12 @@ class Trainer:
             ) / n
         )
         avg_steps = sum(t.total_steps for t in trajectories) / n
+        task_score = _mean_last_step_metric(trajectories, "task_score")
+        won_rate = _mean_last_step_metric(trajectories, "won")
         print(
             f"  [val @ step {global_step}] r={avg_reward:+.2f} "
             f"a={answered_rate:.0%} c={correct_rate:.0%} "
+            f"score={task_score:.2f} won={won_rate:.0%} "
             f"avg_steps={avg_steps:.1f}  (n={n})",
             flush=True,
         )
@@ -570,6 +600,8 @@ class Trainer:
                     "val/answered": answered_rate,
                     "val/correct": correct_rate,
                     "val/avg_steps": avg_steps,
+                    "val/task_score": task_score,
+                    "val/won": won_rate,
                     "val/n": n,
                 },
                 step=global_step,
@@ -598,8 +630,12 @@ class Trainer:
             else self.config.training.epsilon
         )
 
-        # Collect all (prompt_tokens, action_tokens, old_log_probs, advantage) pairs
+        # Collect all (prompt_tokens, action_tokens, old_log_probs, advantage) pairs.
+        # We also remember which traj each sample belongs to so the ref_lps
+        # loop below can reuse a per-trajectory KV cache (samples within a
+        # trajectory share a monotonically extending prompt prefix).
         samples = []
+        sample_traj_idx: list[int] = []
         for traj_idx, traj in enumerate(trajectories):
             for step_idx, step in enumerate(traj.steps):
                 if len(step.action_tokens) == 0:
@@ -610,6 +646,7 @@ class Trainer:
                     step.log_probs,
                     advantages[traj_idx][step_idx],
                 ))
+                sample_traj_idx.append(traj_idx)
 
         if not samples:
             return 0.0
@@ -630,9 +667,25 @@ class Trainer:
         # within a global trust region of the initial model — without this
         # we observed empirical collapse around batch 18 of the Calculator
         # and NumberLine runs.
+        #
+        # ref_lps is the second-largest forward cost of the update (about
+        # 6 min/batch on Qwen3-4B with 16 trajs × ~7 steps × ~2k-token
+        # prompts). Within a trajectory each step's prompt extends the
+        # previous, so we can keep a per-trajectory KV cache and feed only
+        # the delta tokens — matching the rollout-side prompt cache trick.
+        # On the bench (8-turn WebShop) this cuts ref_lps token volume to
+        # ~24% of the no-cache version.
         ref_lps_per_sample: list[mx.array] = []
         self.policy.eval()
         with self.policy.reference():
+            # NOTE: an episode-aware cached version of this loop was
+            # prototyped (see scripts/verify_ref_lps_cache.py) but the
+            # cached forward produced different log-probs from a fresh
+            # forward at intermediate positions on Qwen3-4B (max |Δ| ≈
+            # 0.4 logit), suggesting a subtle interaction with
+            # mx.fast.scaled_dot_product_attention's "causal" mask when
+            # query length < key length. Reverted to per-sample fresh
+            # forward; revisit when MLX behaviour is verified.
             for prompt_toks, action_toks, _old_lps_list, _adv in samples:
                 rl = _compute_log_probs_mx(self.policy.model, prompt_toks, action_toks)
                 mx.eval(rl)
@@ -728,11 +781,13 @@ class Trainer:
             total_loss += epoch_loss_sum / n_samples
             n_updates += 1
 
-        # Estimate observed KL post-update for the adaptive controller.
-        # MLX's value_and_grad API only computes gradients when called via
-        # nn.value_and_grad(...), so a plain forward here doesn't accumulate
-        # any graph — we just need mx.eval() to materialize the tensor.
-        if self._kl_ctrl is not None:
+        # Estimate observed KL post-update so the *adaptive* controller can
+        # tune kl_coef. The fixed controller ignores the value, so the loop
+        # is pure waste in that mode — and at ~6 min/batch on Qwen3-4B with
+        # WebShop-length prompts it is the second-largest item in the per-
+        # batch budget after PPO backprop. Skip it for fixed mode; revisit
+        # if we ever want to log observed-KL as a side metric.
+        if isinstance(self._kl_ctrl, AdaptiveKLController):
             kls = []
             for (prompt_toks, action_toks, _ol, _adv), ref_lps in zip(
                 samples, ref_lps_per_sample
@@ -758,6 +813,71 @@ class Trainer:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _mean_last_step_metric(trajectories: list[Trajectory], key: str) -> float:
+    """Mean of ``step.info[key]`` taken from each trajectory's last step.
+
+    Trajectories whose last step lacks the key are skipped. Returns 0.0 when
+    no trajectory contributes a value (e.g. envs that don't populate info).
+    """
+    vals: list[float] = []
+    for t in trajectories:
+        if not t.steps:
+            continue
+        v = t.steps[-1].info.get(key)
+        if v is None:
+            continue
+        vals.append(float(v))
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _compute_log_probs_mx_cached(
+    model: nn.Module,
+    prompt_tokens: list[int],
+    action_tokens: list[int],
+    prompt_cache,
+    cache_offset: int,
+) -> mx.array:
+    """Like ``_compute_log_probs_mx`` but reuses an existing KV cache.
+
+    The caller must guarantee that ``prompt_cache`` already contains exactly
+    ``cache_offset`` tokens, and those tokens are a prefix of
+    ``prompt_tokens``. We feed the remaining ``prompt_tokens[cache_offset:]
+    + action_tokens[:-1]`` through the model with the cache attached, then
+    gather log-probs for ``action_tokens`` from the resulting logits.
+
+    After this call the cache holds ``prompt_tokens + action_tokens[:-1]``
+    (i.e. ``cache_offset + len(delta_prompt) + len(action) - 1`` tokens).
+
+    Returns mx.array of shape (len(action_tokens),).
+    """
+    delta_prompt = prompt_tokens[cache_offset:]
+    n_action = len(action_tokens)
+    if not delta_prompt and n_action == 1:
+        # Cache covers full prompt and action is a single token. We can't
+        # call model with 0 inputs, so re-feed the last prompt token (after
+        # trimming cache by 1) to get a logit position for action[0].
+        trim_prompt_cache(prompt_cache, 1)
+        delta_prompt = prompt_tokens[-1:]
+
+    full_input = list(delta_prompt) + list(action_tokens[:-1])
+    if not full_input:
+        # Single-action with empty delta-prompt and no action[:-1]: shouldn't
+        # happen after the trim above, but guard anyway.
+        raise RuntimeError(
+            "_compute_log_probs_mx_cached: cannot forward zero tokens"
+        )
+    input_ids = mx.array(full_input)
+    logits = model(input_ids[None], cache=prompt_cache)  # (1, T_in, V)
+    log_probs_all = nn.log_softmax(logits[0], axis=-1)  # (T_in, V)
+
+    # Position of logit predicting action[k] = (len(delta_prompt) - 1) + k
+    start = len(delta_prompt) - 1
+    result = log_probs_all[start : start + n_action, :]
+    indices = mx.array(action_tokens)
+    gathered = result[mx.arange(n_action), indices]
+    return gathered
 
 
 def _compute_log_probs_mx(

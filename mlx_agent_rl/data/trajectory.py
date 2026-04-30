@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -9,6 +9,7 @@ class Step:
     reward: float
     done: bool
     anchor_obs: str
+    info: dict = field(default_factory=dict)
 
 
 @dataclass

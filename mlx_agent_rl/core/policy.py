@@ -88,9 +88,34 @@ class Policy:
         )
 
     def generate_with_log_probs(
-        self, prompt: str, max_tokens: int = 256
+        self, prompt: str, max_tokens: int = 256,
+        stop_strings: list[str] | None = None,
+        prompt_cache=None,
+        delta_tokens: list[int] | None = None,
     ) -> tuple[str, list[float], list[int]]:
         """Generate text and collect per-token log probabilities.
+
+        Parameters
+        ----------
+        stop_strings:
+            Optional list of substrings; generation halts as soon as the
+            decoded output ends with any of them. Crucial for short
+            structured outputs (e.g. ``</action>``) where leaving
+            ``max_tokens=256`` causes the model to keep babbling for
+            hundreds of tokens after the useful payload, dominating
+            wall-clock per turn.
+        prompt_cache:
+            Optional pre-populated KV cache (a list of cache objects from
+            ``mlx_lm.models.cache.make_prompt_cache``). When provided, the
+            cache is extended in-place with the prompt's tokens during
+            prefill, and any generated tokens. Reusing a cache across
+            turns of the same episode skips re-processing the unchanged
+            prefix. Pair with ``delta_tokens`` to feed only the new tail.
+        delta_tokens:
+            When provided alongside ``prompt_cache``, only these tokens are
+            fed (the cache is assumed to already represent the preceding
+            prefix). When omitted, the full ``prompt`` is tokenized and
+            fed; useful for the first turn of a cached episode.
 
         Returns
         -------
@@ -105,32 +130,48 @@ class Policy:
             do not preserve token boundaries, which silently misaligns
             ``log_probs`` and the recomputed ones inside the trainer.
         """
-        prompt_tokens = self._wrapped_tokenizer.encode(prompt)
-        if isinstance(prompt_tokens, list):
-            prompt_array = mx.array(prompt_tokens)
+        if delta_tokens is not None:
+            prompt_array = mx.array(delta_tokens)
         else:
-            prompt_array = prompt_tokens
+            prompt_tokens = self._wrapped_tokenizer.encode(prompt)
+            if isinstance(prompt_tokens, list):
+                prompt_array = mx.array(prompt_tokens)
+            else:
+                prompt_array = prompt_tokens
 
         sampler = make_sampler(temp=self.temperature, top_p=self.top_p)
 
         generated_tokens: list[int] = []
         log_probs: list[float] = []
+        # Re-decode every N tokens to check stop_strings; decoding the full
+        # accumulated tail is cheap for short tails (<100 toks) but adds up
+        # if done every step, so we batch it.
+        stop_check_every = 4
+
+        eos_ids = self._wrapped_tokenizer.eos_token_ids
 
         for token, logprob_vec in generate_step(
             prompt_array,
             self.model,
             max_tokens=max_tokens,
             sampler=sampler,
+            prompt_cache=prompt_cache,
         ):
             tok_id = int(token)
-            if tok_id in self._wrapped_tokenizer.eos_token_ids:
-                break
+            # Always append before breaking so ``generated_tokens`` length
+            # stays in sync with the KV-cache offset (the cache already
+            # absorbed this token before generate_step yielded). Callers
+            # that reuse the cache across turns rely on this invariant.
             generated_tokens.append(tok_id)
-            # logprob_vec is shape (vocab,) of log-probabilities
-            lp = float(logprob_vec[tok_id])
-            log_probs.append(lp)
+            log_probs.append(float(logprob_vec[tok_id]))
+            if tok_id in eos_ids:
+                break
             if len(generated_tokens) >= max_tokens:
                 break
+            if stop_strings and len(generated_tokens) % stop_check_every == 0:
+                tail = self.tokenizer.decode(generated_tokens[-32:])
+                if any(s in tail for s in stop_strings):
+                    break
 
         text = self.tokenizer.decode(generated_tokens)
         return text, log_probs, generated_tokens
