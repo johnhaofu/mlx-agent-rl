@@ -106,9 +106,10 @@ class TrainingConfig:
 class EnvironmentConfig:
     type: str = "calculator"
     invalid_action_penalty: float = -0.1
-    base_url: str | None = None  # WebShop sidecar URL when type=='webshop'
-    use_tools_schema: bool = True  # WebShop: pass tools to chat template (Qwen3 native)
+    base_url: str | None = None  # sidecar URL for HTTP envs (webshop/hotpotqa)
+    use_tools_schema: bool = True  # pass tools to chat template (Qwen3 native)
     dense_reward: bool = False  # WebShop: use continuous task_score instead of binary won
+    split: str = "train"  # HotpotQA: which sidecar split to sample from
 
 
 @dataclass
@@ -220,6 +221,7 @@ class TrainerConfig:
                 base_url=e.get("base_url", None),
                 use_tools_schema=e.get("use_tools_schema", True),
                 dense_reward=e.get("dense_reward", False),
+                split=e.get("split", "train"),
             )
 
         if "memory" in raw:
@@ -433,10 +435,19 @@ class Trainer:
                 use_tools_schema=getattr(config, "use_tools_schema", True),
                 dense_reward=getattr(config, "dense_reward", False),
             )
+        elif env_type == "hotpotqa":
+            from mlx_agent_rl.environments.hotpotqa import HotpotQAEnvironment
+
+            base_url = getattr(config, "base_url", None) or "http://192.168.0.117:3002"
+            return HotpotQAEnvironment(
+                base_url=base_url,
+                split=getattr(config, "split", "train"),
+                use_tools_schema=getattr(config, "use_tools_schema", False),
+            )
         else:
             raise ValueError(
                 f"Unknown environment type: {env_type!r}. "
-                f"Choose from: calculator, numberline, webshop."
+                f"Choose from: calculator, numberline, webshop, hotpotqa."
             )
 
     # ------------------------------------------------------------------
