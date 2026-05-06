@@ -10,12 +10,15 @@ metric for agent deployment readiness: a 50% pass@1 model that's coin-flip
 random is much worse than a 45% pass@1 model that's deterministic.
 
 Usage:
-    uv run python scripts/eval_spider_passk.py [config] [n] [split] [k] [adapter]
+    uv run python scripts/eval_spider_passk.py [config] [n] [split] [k] [adapter] [temp]
 
     n:         number of dev/test questions (default 128)
     split:     train | validation | test  (default test)
     k:         samples per question (default 5)
-    adapter:   optional path to LoRA adapter checkpoint dir
+    adapter:   optional path to LoRA adapter checkpoint dir (use "" to skip)
+    temp:      sampling temperature (default = cfg.training.val_temperature).
+               1.0 matches training distribution (canonical pass^k); 0.7 is
+               OpenAI default; 0.4 reflects low-noise deployment.
 """
 
 from __future__ import annotations
@@ -37,8 +40,9 @@ def main() -> None:
     n_val = int(sys.argv[2]) if len(sys.argv) > 2 else 128
     split = sys.argv[3] if len(sys.argv) > 3 else "test"
     k = int(sys.argv[4]) if len(sys.argv) > 4 else 5
-    adapter_dir = sys.argv[5] if len(sys.argv) > 5 else None
+    adapter_dir = sys.argv[5] if len(sys.argv) > 5 and sys.argv[5] else None
     cfg = TrainerConfig.from_yaml(cfg_path)
+    temperature = float(sys.argv[6]) if len(sys.argv) > 6 else cfg.training.val_temperature
 
     print(f"[setup] split={split}  n={n_val}  k={k}  adapter={adapter_dir}",
           flush=True)
@@ -54,8 +58,9 @@ def main() -> None:
         policy.load_adapters(adapter_dir)
     policy.eval()
     # Sample with temperature > 0 — pass^k only makes sense under stochastic
-    # decoding. We use the val_temperature (0.4) as a moderate-noise default.
-    policy.temperature = cfg.training.val_temperature
+    # decoding. Default uses val_temperature; pass an explicit `temp` arg
+    # to e.g. 1.0 to measure consistency under the training distribution.
+    policy.temperature = temperature
     policy.top_p = cfg.training.val_top_p
 
     env = SQLAgentEnvironment(
@@ -80,9 +85,28 @@ def main() -> None:
     print(f"[run] {n_val} questions × k={k} samples = {n_val*k} rollouts "
           f"(temp={policy.temperature}) …", flush=True)
 
+    # Chunked collection so we can print progress between chunks. The
+    # underlying sequential collector doesn't expose a per-rollout hook,
+    # but feeding it chunk by chunk costs nothing (prompt cache resets
+    # per episode anyway under multi-turn rollout).
+    CHUNK = 8  # questions per chunk → CHUNK * k rollouts between progress prints
+    trajectories = []
     t0 = time.perf_counter()
-    # group_size=k: for each prompt, collector returns k trajectories sharing uid.
-    trajectories = collector.collect(val_dataset, group_size=k)
+    for i in range(0, n_val, CHUNK):
+        chunk = val_dataset[i : i + CHUNK]
+        chunk_trajs = collector.collect(chunk, group_size=k)
+        trajectories.extend(chunk_trajs)
+        done = min(i + CHUNK, n_val)
+        elapsed_so_far = time.perf_counter() - t0
+        rate = len(trajectories) / max(elapsed_so_far, 1e-6)
+        remaining_rollouts = n_val * k - len(trajectories)
+        eta = remaining_rollouts / max(rate, 1e-6)
+        print(
+            f"  [{done}/{n_val} questions  {len(trajectories)}/{n_val*k} rollouts]  "
+            f"{elapsed_so_far:.0f}s elapsed  ETA {eta:.0f}s  "
+            f"({rate:.2f} rollouts/s)",
+            flush=True,
+        )
     elapsed = time.perf_counter() - t0
 
     # Group successes per question
