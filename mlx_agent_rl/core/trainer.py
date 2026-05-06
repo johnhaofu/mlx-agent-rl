@@ -116,6 +116,7 @@ class EnvironmentConfig:
     schema_max_chars: int = 4000  # SQL agent: cap on initial-obs schema block
     rows_per_query: int = 10  # SQL agent: rows shown after sql[…]
     partial_credit: float = 0.1  # SQL agent: reward for valid SQL with wrong result; 0 disables (v4 ablation)
+    format_reward: float = 0.0  # SQL agent: small bonus per well-formed action; 0 disables (default)
 
 
 @dataclass
@@ -234,6 +235,7 @@ class TrainerConfig:
                 schema_max_chars=e.get("schema_max_chars", 4000),
                 rows_per_query=e.get("rows_per_query", 10),
                 partial_credit=e.get("partial_credit", 0.1),
+                format_reward=e.get("format_reward", 0.0),
             )
 
         if "memory" in raw:
@@ -476,6 +478,7 @@ class Trainer:
                 rows_per_query=getattr(config, "rows_per_query", 10),
                 use_tools_schema=getattr(config, "use_tools_schema", False),
                 partial_credit=getattr(config, "partial_credit", 0.1),
+                format_reward=getattr(config, "format_reward", 0.0),
             )
         else:
             raise ValueError(
@@ -544,13 +547,15 @@ class Trainer:
                 # Compute advantages
                 advantages = self.algorithm.compute(trajectories)
 
-                # DAPO-style dynamic sampling: groups whose trajectories all
-                # got the same reward have zero advantage variance and
-                # contribute zero gradient. Filtering them out doesn't waste
-                # rollouts (already collected) but cleans up the loss
-                # signal — when ~12-15% of groups are zero-variance under
-                # binary reward, dropping them avoids accumulating their
-                # near-zero advantages alongside informative ones.
+                # DAPO-style dynamic sampling (Yu et al. 2025): drop groups
+                # whose trajectories ALL got the maximum or ALL got the
+                # minimum reward — these groups have no learning signal
+                # since (r_i - mean) = 0 for every trajectory. The original
+                # DAPO paper specifies "remove all samples with reward = 0
+                # or reward = 1 for all samples in the batch (no learning
+                # signal)" — for binary reward this matches our prior
+                # implementation; for partial-credit setups it's strictly
+                # less aggressive (preserves groups that mix 0 and partial).
                 used_trajectories = trajectories
                 used_advantages = advantages
                 n_dropped_groups = 0
@@ -559,13 +564,21 @@ class Trainer:
                     groups: dict[str, list[int]] = _dd(list)
                     for i, t in enumerate(trajectories):
                         groups[t.uid].append(i)
+                    # Reward extremes across the whole batch (DAPO uses 0/1
+                    # explicitly; we use empirical max/min so the rule
+                    # generalizes when partial_credit > 0 or rewards are
+                    # shifted by format_reward).
+                    all_rewards = [t.episode_reward for t in trajectories]
+                    r_max, r_min = max(all_rewards), min(all_rewards)
                     keep_idx: list[int] = []
                     for idxs in groups.values():
                         rewards = [trajectories[i].episode_reward for i in idxs]
-                        if max(rewards) - min(rewards) > 1e-6:
-                            keep_idx.extend(idxs)
-                        else:
+                        all_max = all(r >= r_max - 1e-6 for r in rewards)
+                        all_min = all(r <= r_min + 1e-6 for r in rewards)
+                        if all_max or all_min:
                             n_dropped_groups += 1
+                        else:
+                            keep_idx.extend(idxs)
                     if keep_idx and n_dropped_groups > 0:
                         used_trajectories = [trajectories[i] for i in keep_idx]
                         used_advantages = [advantages[i] for i in keep_idx]
