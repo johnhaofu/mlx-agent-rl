@@ -129,8 +129,18 @@ model. Drift = ability to learn new behaviors. v5 gives up the medium/hard
 gains v4 found via aggressive drift, in exchange for preserving the base
 model's strengths on easy/extra. Net change: zero overall.
 
-For tasks where you want raw EX, skip the KL anchor. For tasks where you
-specifically need to protect base behavior on a subset, KL is a knob.
+The deeper mechanism is *RL's Razor* (Shenfeld et al. 2026): on-policy RL
+already implicitly minimizes reverse-KL to the base policy, biasing toward
+high-reward solutions that stay close in KL. Adding an *explicit* KL term
+on top stacks two regularizers. Empirically the authors show forgetting
+correlates R²=0.96 with KL drift, so the implicit version is plenty.
+Stacking explicit KL just clamps the drift further, which protects
+already-strong buckets (easy/extra) but suppresses useful exploration on
+the buckets where RL is finding new behavior (medium/hard).
+
+For tasks where you want raw EX, skip the KL anchor — RL's Razor handles
+the regularization for free. For tasks where you specifically need to
+protect base behavior on a subset, KL is a knob.
 
 ### 3.3 Scaling up training data doesn't help (at fixed compute)
 
@@ -143,6 +153,15 @@ data means each unique question gets fewer gradient updates. With sparse
 binary reward, fewer updates per question = fewer chances to lock in a
 useful policy. The result is a thinner policy spread over a wider
 distribution. Going wider needs to scale both data and updates together.
+
+In hindsight this matches Lambert (2026) Ch 7's framing of RLVR: "While
+standard instruction tuning is done with 1 or 2 epochs of loss updates
+over the data, RLVR gets its name by doing **hundreds or thousands of
+epochs over the same few data points** to give the model time to learn
+new behaviors." We ran 2 epochs over n=300 — already at the floor of the
+RLVR regime, and our v3/v6 attempts went the wrong direction by adding
+data instead of adding epochs. The right scaling axis is "epochs per
+problem", not "problem count".
 
 ## 4. The bug we found
 
@@ -183,6 +202,34 @@ whether your trainer actually uses your `epsilon_high`**. The DAPO paper
 recommends `epsilon_high > epsilon` ("clip-higher") for stronger upward
 updates on positive advantages, and several open-source frameworks have
 similar dead-config bugs.
+
+**Caveat on v8's failure (added after rereading Lambert 2026 §6.3.3).**
+Even with the fix in place, v8 (asymmetric clip 0.2/0.4 + dynamic
+sampling) failed to outperform v4. The simple "clip was disabled"
+explanation isn't sufficient. Two structural reasons:
+
+1. We use `ppo_epochs=1` and our PPO ratio is `π_θ / π_ref` (against the
+   *base* model, not the rollout-time policy). With one gradient step
+   per batch, the rollout policy and the policy at update time are
+   effectively the same, so the per-token ratio is dominated by the LoRA
+   delta from base. Early in training that delta is tiny — `ratio ≈ 1`
+   — and clipping is a near no-op regardless of `epsilon_high`. Lambert
+   notes this directly: "PPO and GRPO are often run with only one
+   gradient step per batch, which means that the PPO-native
+   regularization is never applied".
+
+2. Our `dynamic_sampling` filter drops zero-variance *groups* before the
+   loss, but DAPO's original dynamic sampling drops *prompts* whose
+   *whole batch* is uniform. Dropping at the group granularity is more
+   aggressive and removes ~80% of trajectories under our binary reward
+   regime, leaving very little signal per gradient step.
+
+The right tool for the "rare-but-important token gets zero gradient"
+problem isn't asymmetric PPO clipping — it's CISPO (Lambert §6.1.8),
+which clips importance *weights* (with a stop-gradient) instead of the
+*objective*, so every token still receives a gradient proportional to
+its advantage. We haven't tried CISPO yet; it's near the top of the
+follow-up list below.
 
 ## 5. The real bottleneck: group-variance collapse
 
