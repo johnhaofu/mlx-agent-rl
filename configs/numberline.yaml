@@ -1,0 +1,54 @@
+model:
+  path: /Users/junhao/models/Qwen2.5-1.5B-Instruct
+  quantize: 4
+  lora:
+    rank: 8
+    layers: 4
+rollout:
+  group_size: 8              # match verl-agent NumberLine — 64 traj per update with batch_size=8
+  max_steps: 6               # tighter than verl-agent's 2*max_position=10 to fit Mac memory; optimal solution is ≤5 steps
+  max_tokens: 128            # short turns — model only needs to emit a tool_call
+  system_prompt: |
+    You are playing a number-line game. You see a target number and a current
+    number. Each turn, call the `move` tool with direction='+' to add 1 or '-'
+    to subtract 1 from the current number. Continue until the current number
+    matches the target. You MUST call the move tool every turn.
+training:
+  algorithm: gigpo
+  lr: 0.000001         # 1e-6 — verl-agent's exact NumberLine lr
+  epochs: 5
+  batch_size: 16             # match verl-agent NumberLine train_data_size; 16×8=128 traj/update
+  epsilon: 0.2
+  epsilon_high: 0.28
+  micro_batch_size: 4
+  val_interval: 5
+  val_temperature: 0.4
+  val_top_p: 1.0
+  ppo_epochs: 1              # match verl-agent: one update per rollout (no inner PPO loop)
+  kl_coef: 0.01              # match verl-agent NumberLine kl_loss_coef
+  clip_ratio_c: 3.0          # dual-clip lower bound for negative-advantage steps
+  entropy_coef: 0.001        # small entropy bonus to keep policy from collapsing
+  kl_ctrl_type: adaptive     # auto-tune kl_coef toward kl_target
+  kl_target: 0.01            # observed KL target per update
+  kl_horizon: 200            # how fast the controller adapts
+  gigpo_mode: mean_norm      # match verl-agent NumberLine mode
+  val_before_train: true     # run a baseline val at step 0 for a clean reference point
+environment:
+  type: numberline
+  invalid_action_penalty: -0.1
+memory:
+  window_size: 3
+mlc:
+  enabled: false
+  model_id: ""
+llamacpp:
+  enabled: false
+  gguf_path: ""
+  port: 8090
+  n_parallel: 8
+  n_ctx: 16384
+wandb:
+  enabled: true
+  project: mlx-agent-rl
+  run_name: numberline_qwen3_06b_gigpo
+  tags: [qwen3-0.6b, gigpo, numberline]

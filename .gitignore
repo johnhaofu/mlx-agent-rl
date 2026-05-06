@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+.pytest_cache/
+.DS_Store
+wandb/
+
+# Spider dataset (download from yale-lily.github.io/spider, ~5GB)
+data/
+
+# RL training artifacts (LoRA adapters go to HF Hub, not git)
+outputs/
+
+# Local-only intermediate drafts
+spider_rl_blog.html
+spider_rl_report.html

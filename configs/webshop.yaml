@@ -1,0 +1,59 @@
+model:
+  path: /Users/junhao/models/Qwen3-4B-MLX-4bit
+  quantize: null  # already pre-quantized
+  lora:
+    rank: 8
+    layers: 4
+rollout:
+  group_size: 8              # match verl-agent webshop train_data_size×group_size sample
+  max_steps: 15              # WebShop typical 5-15 turns; verl uses unbounded but 15 is plenty
+  max_tokens: 256            # verl-style <think>+<action> is short — no thinking budget needed
+  enable_thinking: false     # disable Qwen3 reasoning mode; verl-agent emits <think> manually
+  system_prompt: |
+    You are an autonomous shopping agent in the WebShop e-commerce environment.
+    Find and buy the product that best matches the instruction.
+
+    Each turn you receive the current page text plus a list of admissible
+    actions. Pick exactly one and reply with ONLY this format:
+
+    <action>search[free-text query]</action>      (when search[query] is admissible)
+    <action>click[clickable label or asin]</action>  (any other admissible click)
+
+    No prose, no commentary, no JSON. Just one <action>...</action> tag.
+    ASCII only inside <action>.
+training:
+  algorithm: gigpo
+  lr: 0.000001
+  epochs: 5
+  batch_size: 16
+  epsilon: 0.2
+  epsilon_high: 0.28
+  micro_batch_size: 4
+  val_interval: 5
+  val_temperature: 0.4
+  val_top_p: 1.0
+  ppo_epochs: 1
+  kl_coef: 0.001            # match verl-agent webshop
+  clip_ratio_c: 3.0
+  entropy_coef: 0.0
+  kl_ctrl_type: fixed
+  kl_target: 0.01
+  kl_horizon: 200
+  gigpo_mode: mean_norm
+  val_before_train: true
+environment:
+  type: webshop
+  base_url: http://192.168.0.117:3001
+  invalid_action_penalty: -0.1
+  use_tools_schema: false    # verl-style <action> envelope; no tools schema in chat template
+memory:
+  window_size: 4             # last 4 (obs, action) pairs in chat history
+mlc:
+  enabled: false
+llamacpp:
+  enabled: false
+wandb:
+  enabled: true
+  project: mlx-agent-rl
+  run_name: webshop_qwen3_4b_gigpo
+  tags: [qwen3-4b, gigpo, webshop]
