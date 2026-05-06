@@ -74,7 +74,9 @@ policy.load_adapters("path/to/checkpoint")
 
 Each training step:
 
-1. **Rollout** — For each math problem, the model interacts with a calculator tool over multiple turns:
+1. **Rollout** — For each problem, the model interacts with a tool environment over multiple turns:
+
+   *Example: GSM8K calculator agent*
    ```
    Model: <think>I need to divide 48 by 2</think><action>calculate(48/2)</action>
    Env:   Result: 24
@@ -83,6 +85,29 @@ Each training step:
    Model: <action>answer(72)</action>
    Env:   Correct! reward=1.0
    ```
+
+   *Example: Spider text-to-SQL agent (real v4 rollout)*
+   ```
+   Env:   Database: concert_singer
+          Schema:
+            CREATE TABLE "singer" (
+              "Singer_ID" int, "Name" text, "Country" text,
+              "Song_Name" text, "Song_release_year" text,
+              "Age" int, "Is_male" bool,
+              PRIMARY KEY ("Singer_ID")
+            ); ... (3 tables total)
+          Question: What are all distinct countries where singers above age 20 are from?
+   Model: <action>sql[SELECT DISTINCT Country FROM singer WHERE Age > 20]</action>
+   Env:   SQL ok (3 rows shown):
+            ('Netherlands',) ('United States',) ('France',)
+   Model: <action>answer[SELECT DISTINCT Country FROM singer WHERE Age > 20]</action>
+   Env:   Answer recorded. EX=1 (match)  reward=1.0
+   ```
+
+   The agent uses `sql[…]` to inspect rows and verify column names against
+   the live SQLite, then commits with `answer[…]`. Reward is binary
+   execution accuracy — does the predicted query produce the same result-set
+   as the gold SQL.
 
 2. **Advantage** — Group trajectories by prompt, compute normalized advantages (GRPO/GiGPO)
 
