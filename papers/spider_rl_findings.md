@@ -280,10 +280,9 @@ data:
 ## 7. Reproducibility
 
 - **Code:** [github.com/johnhaofu/mlx-agent-rl](https://github.com/johnhaofu/mlx-agent-rl)
-- **Adapter checkpoints (HF Hub, ~10MB each):**
-  - v4 best/: TODO HF link
-  - v7 best/: TODO HF link
-  - v9b best/: TODO HF link
+- **Adapter checkpoint:**
+  - v4 best/ (recommended): https://huggingface.co/x32/spider-rl-qwen3-4b
+  - v7 / v9b: available locally in `outputs/`, not yet uploaded
 - **One-command reproduce on M-series Mac:**
 
 ```bash

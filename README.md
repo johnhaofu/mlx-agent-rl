@@ -58,9 +58,9 @@ LoRA adapters are small (~10MB) and hosted on Hugging Face Hub:
 
 | Run | What it is | HF Hub |
 |-----|-----------|--------|
-| Spider v4 | Recommended overall (binary reward, dev 51.6%) | TODO |
-| Spider v7 | Specialized for hard/extra (lora 2× capacity) | TODO |
-| Spider v9b | Stable variant (entropy bonus, smoother val curve) | TODO |
+| Spider v4 ★ | Recommended overall (binary reward, dev 51.6%) | [x32/spider-rl-qwen3-4b](https://huggingface.co/x32/spider-rl-qwen3-4b) |
+| Spider v7 | Specialized for hard/extra (lora 2× capacity) | available locally in `outputs/` |
+| Spider v9b | Stable variant (entropy bonus, smoother val curve) | available locally in `outputs/` |
 
 Load with:
 
