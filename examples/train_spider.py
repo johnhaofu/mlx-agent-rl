@@ -11,7 +11,9 @@ trainer's existing single-env contract, similar to the HotpotQA
 arrangement; later we can plug a held-out env in.
 """
 
+import json
 import sys
+from pathlib import Path
 
 from mlx_agent_rl.core.trainer import Trainer, TrainerConfig
 
@@ -26,13 +28,30 @@ def main() -> None:
     config = TrainerConfig.from_yaml(config_path)
     n_train = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
     n_val = int(sys.argv[3]) if len(sys.argv) > 3 else 128
+    # Optional 4th arg: JSON file with pre-filtered question indices, e.g.
+    # produced by scripts/build_difficulty_filter.py. The file should look
+    # like {"indices": [3, 7, 12, ...], ...}. When provided, train uses
+    # the first n_train of those indices instead of [0:n_train].
+    filter_file = sys.argv[4] if len(sys.argv) > 4 else None
 
-    # train pulls from train_spider.json[0:n_train]; val uses a held-out
-    # tail slice from the same file so we get an independent signal during
-    # training without standing up a second env. Final out-of-distribution
-    # eval against ``test.json`` runs separately via
-    # scripts/eval_spider_by_hardness.py.
-    train = make_dataset(start=0, n=n_train)
+    if filter_file:
+        payload = json.loads(Path(filter_file).read_text())
+        all_indices = payload["indices"]
+        if n_train > len(all_indices):
+            print(
+                f"[warn] filter has only {len(all_indices)} indices; "
+                f"requested n_train={n_train}, will train on all of them",
+                flush=True,
+            )
+            n_train = len(all_indices)
+        train = [{"prompt": "", "answer": i} for i in all_indices[:n_train]]
+        print(f"[filter] using {filter_file} → {len(train)} questions",
+              flush=True)
+    else:
+        # train pulls from train_spider.json[0:n_train]; val uses a held-out
+        # tail slice from the same file so we get an independent signal
+        # during training without standing up a second env.
+        train = make_dataset(start=0, n=n_train)
     val = make_dataset(start=6000, n=n_val)
     print(
         f"Spider: {len(train)} train + {len(val)} val seeds "
