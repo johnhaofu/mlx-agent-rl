@@ -2,7 +2,21 @@
 
 MLX-native multi-turn agent reinforcement learning framework for Apple Silicon.
 
-Train language models to use tools (calculator, search, etc.) through multi-turn RL on your Mac.
+Train language models to use tools (calculator, search, SQL, web shopping, etc.) through multi-turn RL on your Mac.
+
+## Latest results: Spider text-to-SQL
+
+Trained `Qwen3-4B-MLX-4bit` with GiGPO on Yale [Spider 1.0](https://yale-lily.github.io/spider).
+Best recipe lifts dev EX from **44.0% → 51.6%** (+7.6pp absolute, n=1034).
+
+Counter-intuitive findings worth a read in the full report:
+- Partial-credit reward **hurts** vs binary 1.0/0.0 (-2.4pp on test, -9pp on medium)
+- KL anchor at 0.001 doesn't lift overall, just **redistributes** across hardness buckets
+- Scaling training data 300 → 600 **regressed** at fixed compute
+- 87% of GiGPO groups had **zero reward variance** — the real bottleneck
+- A trainer bug was silently coercing `epsilon_high` for non-DAPO algorithms (fixed)
+
+→ See [`papers/spider_rl_findings.md`](papers/spider_rl_findings.md) for the full ablation across 9 experiments.
 
 ## Features
 
@@ -28,8 +42,32 @@ Trainer
 ## Quick Start
 
 ```bash
-pip install -e ".[dev]"
-python examples/train_gsm8k.py configs/gsm8k_calculator.yaml
+# install
+uv sync   # or: pip install -e ".[dev]"
+
+# Spider text-to-SQL (best results, ~10h on M-series)
+uv run python examples/train_spider.py configs/spider_v4.yaml 300 128
+
+# GSM8K calculator agent
+uv run python examples/train_gsm8k.py configs/gsm8k_calculator.yaml
+```
+
+## Pre-trained adapters
+
+LoRA adapters are small (~10MB) and hosted on Hugging Face Hub:
+
+| Run | What it is | HF Hub |
+|-----|-----------|--------|
+| Spider v4 | Recommended overall (binary reward, dev 51.6%) | TODO |
+| Spider v7 | Specialized for hard/extra (lora 2× capacity) | TODO |
+| Spider v9b | Stable variant (entropy bonus, smoother val curve) | TODO |
+
+Load with:
+
+```python
+from mlx_agent_rl.core.policy import Policy
+policy = Policy(model_path="Qwen3-4B-MLX-4bit", lora_rank=8, lora_layers=4)
+policy.load_adapters("path/to/checkpoint")
 ```
 
 ## How It Works
