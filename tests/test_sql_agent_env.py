@@ -204,6 +204,35 @@ def test_stop_strings_present():
     assert "</action>" in env.stop_strings
 
 
+def test_format_reward_off_by_default():
+    # format_reward defaults to 0.0 — preserves v4-era reward shape.
+    env = _env()
+    env.reset(prompt="", answer=0)
+    _, sql_r, _ = env.step("sql[SELECT count(*) FROM head]")
+    assert sql_r == 0.0
+
+
+def test_format_reward_on_adds_to_sql_step():
+    env = SQLAgentEnvironment(
+        data_dir=_SPIDER_DATA, split="train", format_reward=0.05,
+    )
+    env.reset(prompt="", answer=0)
+    _, sql_r, _ = env.step("sql[SELECT count(*) FROM head]")
+    assert sql_r == pytest.approx(0.05)
+
+
+def test_format_reward_on_adds_to_match_answer():
+    env = SQLAgentEnvironment(
+        data_dir=_SPIDER_DATA, split="train", format_reward=0.05,
+    )
+    env.reset(prompt="", answer=0)
+    gold = env.gold_sql
+    _, ans_r, done = env.step(f"answer[{gold}]")
+    # 1.0 (match) + 0.05 (format) = 1.05; format_reward stacks atop main reward.
+    assert ans_r == pytest.approx(1.05)
+    assert done is True
+
+
 # ----------------------------------------------------------------------
 # _exec_match low-level
 # ----------------------------------------------------------------------

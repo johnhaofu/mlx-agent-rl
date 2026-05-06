@@ -175,6 +175,7 @@ class SQLAgentEnvironment(BaseEnvironment):
         require_think: bool = False,
         use_tools_schema: bool = False,
         partial_credit: float = 0.1,
+        format_reward: float = 0.0,
     ) -> None:
         self.data_dir = Path(data_dir) if data_dir else _DEFAULT_DATA_DIR
         # Test split lives in a separate database directory.
@@ -188,6 +189,12 @@ class SQLAgentEnvironment(BaseEnvironment):
         self.require_think = require_think
         self.use_tools_schema = use_tools_schema
         self.partial_credit = partial_credit
+        # Small bonus paid on every well-formed action (sql[…] or answer[…])
+        # to reinforce envelope/syntax correctness during early training.
+        # Default 0.0 (off) — invalid_action_penalty (-0.1) already gives
+        # the negative signal; format_reward is a knob for runs where you
+        # want to explicitly accelerate format lock-in.
+        self.format_reward = format_reward
         self._examples = self._load_examples(split)
         self._schema_cache: dict[str, str] = {}
         self._reset_state()
@@ -386,7 +393,7 @@ class SQLAgentEnvironment(BaseEnvironment):
         self._last_obs = obs_text
         return (
             Observation(text=obs_text, done=False, anchor=self._anchor()),
-            0.0,
+            self.format_reward,  # 0.0 by default; small bonus for well-formed sql[…]
             False,
         )
 
@@ -422,6 +429,12 @@ class SQLAgentEnvironment(BaseEnvironment):
             obs_text = "Answer recorded. EX=0 (different result)"
             reward = self.partial_credit
             partial = self.partial_credit > 0
+        # format_reward is added on top regardless of correctness — the agent
+        # got this far through extract_action + the strict step regex, so the
+        # envelope/syntax was well-formed. Constant shifts cancel inside
+        # group-relative advantage, so this only differentiates well-formed
+        # vs invalid_action_penalty=-0.1 trajectories.
+        reward = reward + self.format_reward
         self._last_obs = obs_text
         self._last_partial = partial
         return (
