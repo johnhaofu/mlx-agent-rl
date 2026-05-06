@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import json
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 from mlx_lm import load
 from mlx_lm.generate import generate_step
 from mlx_lm.sample_utils import make_sampler
@@ -54,6 +57,8 @@ class Policy:
 
         # LoRA mode: freeze base, apply LoRA adapters to trailing layers.
         # Full-param mode: leave all parameters trainable (lora_layers=0).
+        self._lora_rank = lora_rank
+        self._lora_layers = lora_layers
         if lora_layers > 0:
             self.model.freeze()
             lora_config = {
@@ -254,3 +259,39 @@ class Policy:
         finally:
             for m, s in saved:
                 m.scale = s
+
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+
+    def save_adapters(self, out_dir: str | Path) -> Path:
+        """Dump trainable (LoRA) weights so a future Policy can load them.
+
+        Writes ``adapters.safetensors`` + ``adapter_config.json`` into
+        ``out_dir``. The config records lora_rank/lora_layers so loading
+        only requires the same base model — we don't pickle the live
+        Python objects, just the small adapter delta (~10-50 MB).
+        """
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        weights = dict(tree_flatten(self.model.trainable_parameters()))
+        mx.save_safetensors(str(out / "adapters.safetensors"), weights)
+        meta = {
+            "lora_rank": self._lora_rank,
+            "lora_layers": self._lora_layers,
+            "lora_parameters": {
+                "rank": self._lora_rank,
+                "scale": 1.0,
+                "dropout": 0.0,
+            },
+        }
+        with open(out / "adapter_config.json", "w") as fh:
+            json.dump(meta, fh, indent=2)
+        return out
+
+    def load_adapters(self, adapter_dir: str | Path) -> None:
+        """Load adapter weights saved by ``save_adapters`` into this Policy."""
+        path = Path(adapter_dir) / "adapters.safetensors"
+        if not path.exists():
+            raise FileNotFoundError(f"no adapters at {path}")
+        self.model.load_weights(str(path), strict=False)

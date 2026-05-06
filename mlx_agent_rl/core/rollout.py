@@ -73,6 +73,7 @@ class RolloutCollector:
         backend=None,
         enable_thinking: bool = False,
         use_prompt_cache: bool = True,
+        per_traj_temperatures: list[float] | None = None,
     ) -> None:
         self.policy = policy
         self.env = env
@@ -83,6 +84,16 @@ class RolloutCollector:
         self.system_prompt = system_prompt
         self.backend = backend
         self.enable_thinking = enable_thinking
+        # Per-trajectory temperature schedule: when set, the i-th trajectory
+        # within a group is sampled at ``per_traj_temperatures[i % len(...)]``.
+        # This forces variance across the group — under uniform temp=1.0 the
+        # policy's modes concentrate so tightly that ~85% of GiGPO groups
+        # collapse to identical reward (zero advantage). Mixing high+low temps
+        # gives explore vs exploit signal in the same group.
+        # PPO loss is unaffected: ``ratio = exp(new_lps - ref_l)`` uses the
+        # model's natural log probs, not the temperature-scaled sampling
+        # distribution. The temp only biases which token gets selected.
+        self.per_traj_temperatures = per_traj_temperatures
         # Native chat-template tool descriptors (Qwen3 etc.). When the env
         # exposes get_tools_schema we pass it through to apply_chat_template,
         # which prepends a <tools> system block and biases the model toward
@@ -135,14 +146,21 @@ class RolloutCollector:
         """Original sequential collection using policy.generate_with_log_probs."""
         all_trajectories: list[Trajectory] = []
 
-        for prompt_dict in prompts:
-            uid = str(uuid.uuid4())
-            question = prompt_dict.get("prompt", "")
-            answer = prompt_dict.get("answer", None)
+        saved_temp = self.policy.temperature
+        try:
+            for prompt_dict in prompts:
+                uid = str(uuid.uuid4())
+                question = prompt_dict.get("prompt", "")
+                answer = prompt_dict.get("answer", None)
 
-            for _ in range(group_size):
-                traj = self._run_episode(question, answer, uid)
-                all_trajectories.append(traj)
+                for i in range(group_size):
+                    if self.per_traj_temperatures:
+                        temps = self.per_traj_temperatures
+                        self.policy.temperature = temps[i % len(temps)]
+                    traj = self._run_episode(question, answer, uid)
+                    all_trajectories.append(traj)
+        finally:
+            self.policy.temperature = saved_temp
 
         return all_trajectories
 

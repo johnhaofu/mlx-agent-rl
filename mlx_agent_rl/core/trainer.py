@@ -76,6 +76,7 @@ class RolloutConfig:
     max_tokens: int = 256
     system_prompt: str = ""
     enable_thinking: bool = False  # Qwen3 reasoning <think>...</think> mode
+    per_traj_temperatures: list[float] | None = None  # cycle temps across group members for diversity
 
 
 @dataclass
@@ -100,6 +101,7 @@ class TrainingConfig:
     kl_target: float = 0.01  # target KL when kl_ctrl_type='adaptive'
     kl_horizon: int = 10000  # adaptation horizon for the adaptive controller
     gigpo_mode: str = "mean_std_norm"  # 'mean_std_norm' (default) or 'mean_norm'
+    dynamic_sampling: bool = False  # DAPO-style: drop zero-reward-variance groups before update
 
 
 @dataclass
@@ -109,7 +111,11 @@ class EnvironmentConfig:
     base_url: str | None = None  # sidecar URL for HTTP envs (webshop/hotpotqa)
     use_tools_schema: bool = True  # pass tools to chat template (Qwen3 native)
     dense_reward: bool = False  # WebShop: use continuous task_score instead of binary won
-    split: str = "train"  # HotpotQA: which sidecar split to sample from
+    split: str = "train"  # HotpotQA / SQL agent: which split to sample from
+    data_dir: str | None = None  # SQL agent: path to data/spider/spider_data
+    schema_max_chars: int = 4000  # SQL agent: cap on initial-obs schema block
+    rows_per_query: int = 10  # SQL agent: rows shown after sql[…]
+    partial_credit: float = 0.1  # SQL agent: reward for valid SQL with wrong result; 0 disables (v4 ablation)
 
 
 @dataclass
@@ -186,6 +192,7 @@ class TrainerConfig:
                 max_tokens=r.get("max_tokens", 256),
                 system_prompt=r.get("system_prompt", ""),
                 enable_thinking=r.get("enable_thinking", False),
+                per_traj_temperatures=r.get("per_traj_temperatures", None),
             )
 
         if "training" in raw:
@@ -211,6 +218,7 @@ class TrainerConfig:
                 kl_target=t.get("kl_target", 0.01),
                 kl_horizon=t.get("kl_horizon", 10000),
                 gigpo_mode=t.get("gigpo_mode", "mean_std_norm"),
+                dynamic_sampling=t.get("dynamic_sampling", False),
             )
 
         if "environment" in raw:
@@ -222,6 +230,10 @@ class TrainerConfig:
                 use_tools_schema=e.get("use_tools_schema", True),
                 dense_reward=e.get("dense_reward", False),
                 split=e.get("split", "train"),
+                data_dir=e.get("data_dir", None),
+                schema_max_chars=e.get("schema_max_chars", 4000),
+                rows_per_query=e.get("rows_per_query", 10),
+                partial_credit=e.get("partial_credit", 0.1),
             )
 
         if "memory" in raw:
@@ -356,6 +368,16 @@ class Trainer:
             )
 
         # Optional W&B logging. Initialized lazily so that pure-test imports
+        # Output directory for LoRA checkpoints. ``run_name`` defaults to
+        # the wandb run name; falls back to a generic ``run`` so even
+        # offline runs leave behind a recoverable artifact.
+        from pathlib import Path as _Path
+        self._out_dir = _Path("outputs") / (
+            config.wandb.run_name or "run"
+        )
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        self._best_val_score: float | None = None
+
         # don't pull wandb or trigger network calls.
         self._wandb = None
         if config.wandb.enabled:
@@ -444,10 +466,21 @@ class Trainer:
                 split=getattr(config, "split", "train"),
                 use_tools_schema=getattr(config, "use_tools_schema", False),
             )
+        elif env_type == "sql_agent":
+            from mlx_agent_rl.environments.sql_agent import SQLAgentEnvironment
+
+            return SQLAgentEnvironment(
+                data_dir=getattr(config, "data_dir", None),
+                split=getattr(config, "split", "train"),
+                schema_max_chars=getattr(config, "schema_max_chars", 4000),
+                rows_per_query=getattr(config, "rows_per_query", 10),
+                use_tools_schema=getattr(config, "use_tools_schema", False),
+                partial_credit=getattr(config, "partial_credit", 0.1),
+            )
         else:
             raise ValueError(
                 f"Unknown environment type: {env_type!r}. "
-                f"Choose from: calculator, numberline, webshop, hotpotqa."
+                f"Choose from: calculator, numberline, webshop, hotpotqa, sql_agent."
             )
 
     # ------------------------------------------------------------------
@@ -511,17 +544,44 @@ class Trainer:
                 # Compute advantages
                 advantages = self.algorithm.compute(trajectories)
 
+                # DAPO-style dynamic sampling: groups whose trajectories all
+                # got the same reward have zero advantage variance and
+                # contribute zero gradient. Filtering them out doesn't waste
+                # rollouts (already collected) but cleans up the loss
+                # signal — when ~12-15% of groups are zero-variance under
+                # binary reward, dropping them avoids accumulating their
+                # near-zero advantages alongside informative ones.
+                used_trajectories = trajectories
+                used_advantages = advantages
+                n_dropped_groups = 0
+                if cfg.training.dynamic_sampling:
+                    from collections import defaultdict as _dd
+                    groups: dict[str, list[int]] = _dd(list)
+                    for i, t in enumerate(trajectories):
+                        groups[t.uid].append(i)
+                    keep_idx: list[int] = []
+                    for idxs in groups.values():
+                        rewards = [trajectories[i].episode_reward for i in idxs]
+                        if max(rewards) - min(rewards) > 1e-6:
+                            keep_idx.extend(idxs)
+                        else:
+                            n_dropped_groups += 1
+                    if keep_idx and n_dropped_groups > 0:
+                        used_trajectories = [trajectories[i] for i in keep_idx]
+                        used_advantages = [advantages[i] for i in keep_idx]
+
                 # Policy update
-                loss = self._update_policy(trajectories, advantages)
+                loss = self._update_policy(used_trajectories, used_advantages)
                 total_loss += loss
                 num_updates += 1
 
                 global_step = epoch * num_batches + batch_idx + 1
+                drop_str = f" drop={n_dropped_groups}" if n_dropped_groups > 0 else ""
                 print(
                     f"  [{batch_idx+1}/{num_batches}] "
                     f"r={avg_reward:+.2f} a={answered_rate:.0%} c={correct_rate:.0%} "
                     f"| ma{len(rolling)}: r={rw_r:+.2f} a={rw_a:.0%} c={rw_c:.0%} "
-                    f"loss={loss:.4f}",
+                    f"loss={loss:.4f}{drop_str}",
                     flush=True,
                 )
 
@@ -551,6 +611,13 @@ class Trainer:
 
             avg_loss = total_loss / max(num_updates, 1)
             print(f"Epoch {epoch + 1}/{cfg.training.epochs}  avg_loss={avg_loss:.4f}", flush=True)
+            epoch_dir = self._out_dir / f"epoch_{epoch + 1:02d}"
+            self.policy.save_adapters(epoch_dir)
+            print(f"  [save] epoch {epoch + 1} adapters → {epoch_dir}", flush=True)
+
+        final_dir = self._out_dir / "final"
+        self.policy.save_adapters(final_dir)
+        print(f"  [save] final adapters → {final_dir}", flush=True)
 
     # ------------------------------------------------------------------
     # Validation eval (low-variance sampling, group_size=1, no policy update)
@@ -618,6 +685,19 @@ class Trainer:
                 step=global_step,
             )
 
+        # Save adapters on val improvement so we always have a recoverable
+        # checkpoint matching the best known val score. ``won_rate`` tracks
+        # the env's primary success metric (EX for Spider, F1≥thresh for
+        # HotpotQA).
+        score = won_rate if won_rate > 0 else correct_rate
+        if self._best_val_score is None or score > self._best_val_score:
+            self._best_val_score = score
+            best_dir = self._out_dir / "best"
+            self.policy.save_adapters(best_dir)
+            print(f"  [save] best val score={score:.3f} → {best_dir}", flush=True)
+        latest_dir = self._out_dir / f"step_{global_step:06d}"
+        self.policy.save_adapters(latest_dir)
+
     # ------------------------------------------------------------------
     # Policy update (PPO-clip)
     # ------------------------------------------------------------------
@@ -629,17 +709,17 @@ class Trainer:
     ) -> float:
         """Compute PPO-clip loss and perform one gradient step.
 
-        For DAPO the clipping uses ``epsilon`` and ``epsilon_high``; for all
-        other algorithms ``epsilon`` is used for both sides.
+        Asymmetric clipping (clip-higher) is active for ALL algorithms when
+        ``epsilon_high > epsilon`` — historically only DAPO used it, but
+        looser upward clip helps any policy gradient method capture
+        positive-advantage updates that get cropped at the symmetric
+        boundary. Set ``epsilon_high == epsilon`` in YAML to fall back
+        to standard symmetric PPO.
 
         Returns the scalar loss value.
         """
         eps_low = self.config.training.epsilon
-        eps_high = (
-            self.config.training.epsilon_high
-            if isinstance(self.algorithm, DAPOEstimator)
-            else self.config.training.epsilon
-        )
+        eps_high = self.config.training.epsilon_high
 
         # Collect all (prompt_tokens, action_tokens, old_log_probs, advantage) pairs.
         # We also remember which traj each sample belongs to so the ref_lps
